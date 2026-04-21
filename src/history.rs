@@ -28,6 +28,24 @@ pub enum Command {
         from: (i32, i32),
         to: (i32, i32),
     },
+    /// The layer at `index` was replaced wholesale — used by the Crop tool
+    /// (which changes buffer dimensions and offset together). `before` and
+    /// `after` are full layer snapshots so undo/redo just swap them in. The
+    /// renderer rebuilds that slot on size change.
+    ReplaceLayer {
+        index: usize,
+        before: Layer,
+        after: Layer,
+    },
+    /// The canvas was resized. Buffers are untouched; every layer's display
+    /// offset was shifted by `offset_delta` so content stays put in absolute
+    /// coordinates. Redo applies the delta and sets dims to `after`; undo
+    /// subtracts the delta and restores `before`.
+    ResizeCanvas {
+        before: (u32, u32),
+        after: (u32, u32),
+        offset_delta: (i32, i32),
+    },
 }
 
 pub struct History {
@@ -113,12 +131,13 @@ impl History {
 }
 
 fn apply_forward(cmd: &Command, document: &mut Document) {
-    let w = document.width;
     match cmd {
         Command::Cells(changes) => {
             for c in changes {
                 if let Some(layer) = document.layers.get_mut(c.layer) {
-                    layer.set(w, c.x, c.y, c.after);
+                    if layer.in_bounds(c.x, c.y) {
+                        layer.set(c.x, c.y, c.after);
+                    }
                 }
             }
         }
@@ -130,22 +149,42 @@ fn apply_forward(cmd: &Command, document: &mut Document) {
         }
         Command::MoveLayer { index, to, .. } => {
             if let Some(layer) = document.layers.get_mut(*index) {
-                if layer.offset != *to {
-                    layer.offset = *to;
-                    layer.full_upload = true;
-                }
+                layer.offset = *to;
             }
+        }
+        Command::ReplaceLayer { index, after, .. } => {
+            if *index < document.layers.len() {
+                let mut layer = after.clone();
+                layer.full_upload = true;
+                layer.dirty_cells.clear();
+                document.layers[*index] = layer;
+                document.bump_resources();
+            }
+        }
+        Command::ResizeCanvas {
+            after,
+            offset_delta,
+            ..
+        } => {
+            document.width = after.0;
+            document.height = after.1;
+            for layer in &mut document.layers {
+                layer.offset.0 += offset_delta.0;
+                layer.offset.1 += offset_delta.1;
+            }
+            document.bump_resources();
         }
     }
 }
 
 fn apply_inverse(cmd: &Command, document: &mut Document) {
-    let w = document.width;
     match cmd {
         Command::Cells(changes) => {
             for c in changes {
                 if let Some(layer) = document.layers.get_mut(c.layer) {
-                    layer.set(w, c.x, c.y, c.before);
+                    if layer.in_bounds(c.x, c.y) {
+                        layer.set(c.x, c.y, c.before);
+                    }
                 }
             }
         }
@@ -163,11 +202,30 @@ fn apply_inverse(cmd: &Command, document: &mut Document) {
         }
         Command::MoveLayer { index, from, .. } => {
             if let Some(layer) = document.layers.get_mut(*index) {
-                if layer.offset != *from {
-                    layer.offset = *from;
-                    layer.full_upload = true;
-                }
+                layer.offset = *from;
             }
+        }
+        Command::ReplaceLayer { index, before, .. } => {
+            if *index < document.layers.len() {
+                let mut layer = before.clone();
+                layer.full_upload = true;
+                layer.dirty_cells.clear();
+                document.layers[*index] = layer;
+                document.bump_resources();
+            }
+        }
+        Command::ResizeCanvas {
+            before,
+            offset_delta,
+            ..
+        } => {
+            document.width = before.0;
+            document.height = before.1;
+            for layer in &mut document.layers {
+                layer.offset.0 -= offset_delta.0;
+                layer.offset.1 -= offset_delta.1;
+            }
+            document.bump_resources();
         }
     }
 }

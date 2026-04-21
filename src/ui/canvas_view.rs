@@ -33,6 +33,15 @@ pub struct CanvasViewState {
     pub line_drag: Option<LineDrag>,
     /// Corners of an in-progress Rectangle-tool drag. Committed on mouse-up.
     pub rect_drag: Option<RectDrag>,
+    /// Corners of an in-progress Crop-tool drag (canvas-space cells).
+    /// Committed on mouse-up: the active layer is resized to match.
+    pub crop_drag: Option<CropDrag>,
+    /// Corners of an in-progress Resize-tool drag. Coordinates are signed
+    /// because the rectangle can extend past the current canvas edges (into
+    /// the viewport's empty margins) to grow the canvas. Committed on
+    /// mouse-up: canvas dims become the rect's size and each layer's offset
+    /// shifts so content stays put.
+    pub resize_drag: Option<ResizeDrag>,
     /// State for an in-progress Move-tool drag on the active layer.
     pub move_drag: Option<MoveDrag>,
     /// Last cell visited by the Pencil during the current stroke. Used to
@@ -119,6 +128,21 @@ pub struct RectDrag {
 }
 
 #[derive(Copy, Clone, Debug)]
+pub struct CropDrag {
+    pub start: (u32, u32),
+    pub end: (u32, u32),
+}
+
+/// Signed endpoints for the Resize tool drag. Unlike most drag states these
+/// aren't clamped to the canvas — the user can drag into the viewport's
+/// margins (beyond the current canvas edges) to grow it.
+#[derive(Copy, Clone, Debug)]
+pub struct ResizeDrag {
+    pub start: (i32, i32),
+    pub end: (i32, i32),
+}
+
+#[derive(Copy, Clone, Debug)]
 pub struct MoveDrag {
     /// Layer being moved (captured at drag start so a mid-drag active-layer
     /// change doesn't redirect the move to a different layer).
@@ -140,6 +164,8 @@ impl Default for CanvasViewState {
             select_drag: None,
             line_drag: None,
             rect_drag: None,
+            crop_drag: None,
+            resize_drag: None,
             move_drag: None,
             pencil_last: None,
             pencil_stroke_fresh: HashSet::new(),
@@ -244,6 +270,22 @@ pub fn show(
             return None;
         }
         Some((cx as u32, cy as u32))
+    });
+
+    // Signed hover cell for tools that need to pick positions past the
+    // current canvas edges (Resize). Hit-tests against the full viewport
+    // rect instead of just the canvas, so margins around the canvas become
+    // addressable. Cells are expressed in canvas-space (can be negative or
+    // beyond document.width/height).
+    let hover_cell_signed = ui.input(|i| i.pointer.hover_pos()).and_then(|p| {
+        if !rect.contains(p) {
+            return None;
+        }
+        let rel = p - unclipped.min;
+        Some((
+            (rel.x / cell_pixel_w).floor() as i32,
+            (rel.y / cell_pixel_h).floor() as i32,
+        ))
     });
 
     // Paste mode short-circuits normal tool dispatch. The ghost overlay
@@ -488,13 +530,14 @@ pub fn show(
             // canvas hover cell by the active layer's offset; if it maps
             // outside the buffer, treat it like no-hover.
             let layer_cell = hover_cell.and_then(|(cx, cy)| {
-                let (dx, dy) = document.layers[document.active_layer].offset;
+                let layer = &document.layers[document.active_layer];
+                let (dx, dy) = layer.offset;
                 let lx = cx as i32 - dx;
                 let ly = cy as i32 - dy;
                 if lx < 0
                     || ly < 0
-                    || lx >= document.width as i32
-                    || ly >= document.height as i32
+                    || lx >= layer.width as i32
+                    || ly >= layer.height as i32
                 {
                     None
                 } else {
@@ -522,15 +565,15 @@ pub fn show(
                         }
                         Some((px, py)) if (px, py) == (x, y) => {}
                         Some((px, py)) => {
+                            let (lw, lh) = {
+                                let layer = &document.layers[document.active_layer];
+                                (layer.width as i32, layer.height as i32)
+                            };
                             let mut prev = (px, py);
                             for (cx, cy) in
                                 tools::bresenham_cells(px as i32, py as i32, x as i32, y as i32)
                             {
-                                if cx < 0
-                                    || cy < 0
-                                    || cx >= document.width as i32
-                                    || cy >= document.height as i32
-                                {
+                                if cx < 0 || cy < 0 || cx >= lw || cy >= lh {
                                     continue;
                                 }
                                 // Skip the first cell — it's where we
@@ -603,10 +646,11 @@ pub fn show(
                     let delta_y = (delta_px.y / cell_pixel_h).round() as i32;
                     let new_offset = (drag.from.0 + delta_x, drag.from.1 + delta_y);
                     if let Some(layer) = document.layers.get_mut(drag.layer_index) {
-                        if layer.offset != new_offset {
-                            layer.offset = new_offset;
-                            layer.full_upload = true;
-                        }
+                        // Offset is uploaded via the per-layer uniform each
+                        // frame, so we don't need a full texture re-upload —
+                        // just mutating `offset` is enough for the shader to
+                        // shift the draw.
+                        layer.offset = new_offset;
                     }
                 }
             }
@@ -621,6 +665,95 @@ pub fn show(
                                 to,
                             });
                         }
+                    }
+                }
+            }
+        }
+        ToolKind::Crop => {
+            // Crop drags in canvas space. On release the active layer is
+            // resized to match the drag rect: offset = rect top-left, buffer
+            // dims = rect size, tiles sampled from the overlap with the old
+            // layer. Undoable through Command::ReplaceLayer.
+            if response.drag_started_by(PointerButton::Primary)
+                || response.clicked_by(PointerButton::Primary)
+            {
+                if let Some(cell) = hover_cell {
+                    view.crop_drag = Some(CropDrag {
+                        start: cell,
+                        end: cell,
+                    });
+                }
+            }
+            if response.dragged_by(PointerButton::Primary) {
+                if let (Some(drag), Some(cell)) = (view.crop_drag.as_mut(), hover_cell) {
+                    drag.end = cell;
+                }
+            }
+            if response.drag_stopped_by(PointerButton::Primary)
+                || (!primary_down && response.clicked_by(PointerButton::Primary))
+            {
+                if let Some(drag) = view.crop_drag.take() {
+                    let rect = CellRect::from_corners(
+                        drag.start.0,
+                        drag.start.1,
+                        drag.end.0,
+                        drag.end.1,
+                    );
+                    // Degenerate 1x1 crops would almost always be a misclick;
+                    // reject them so a stray click doesn't nuke the layer.
+                    if rect.w >= 1 && rect.h >= 1 && !(rect.w == 1 && rect.h == 1) {
+                        tools::commit_crop(
+                            document,
+                            history,
+                            (rect.x as i32, rect.y as i32),
+                            (rect.w, rect.h),
+                        );
+                    }
+                }
+            }
+        }
+        ToolKind::Resize => {
+            // Drag in canvas-space. The start/end corners can sit outside
+            // the current canvas (in the viewport margins) so the user can
+            // grow the canvas as well as shrink it. On release, the canvas
+            // dims become the rect's size and layer offsets shift so
+            // existing content stays at the same absolute position.
+            if response.drag_started_by(PointerButton::Primary)
+                || response.clicked_by(PointerButton::Primary)
+            {
+                if let Some(cell) = hover_cell_signed {
+                    view.resize_drag = Some(ResizeDrag {
+                        start: cell,
+                        end: cell,
+                    });
+                }
+            }
+            if response.dragged_by(PointerButton::Primary) {
+                if let (Some(drag), Some(cell)) = (view.resize_drag.as_mut(), hover_cell_signed) {
+                    drag.end = cell;
+                }
+            }
+            if response.drag_stopped_by(PointerButton::Primary)
+                || (!primary_down && response.clicked_by(PointerButton::Primary))
+            {
+                if let Some(drag) = view.resize_drag.take() {
+                    let (x0, x1) = if drag.start.0 <= drag.end.0 {
+                        (drag.start.0, drag.end.0)
+                    } else {
+                        (drag.end.0, drag.start.0)
+                    };
+                    let (y0, y1) = if drag.start.1 <= drag.end.1 {
+                        (drag.start.1, drag.end.1)
+                    } else {
+                        (drag.end.1, drag.start.1)
+                    };
+                    let rw = (x1 - x0 + 1) as u32;
+                    let rh = (y1 - y0 + 1) as u32;
+                    // Reject degenerate 1x1 commits the same way Crop does —
+                    // a stray click should not nuke the canvas to a single
+                    // cell.
+                    if !(rw == 1 && rh == 1) {
+                        tools::commit_resize(document, history, (x0, y0), (rw, rh));
                     }
                 }
             }
@@ -797,6 +930,68 @@ pub fn show(
         );
         let shape_rect = egui::Rect::from_min_size(shape_min, shape_size);
         painter.rect_stroke(shape_rect, 0.0, outline, egui::StrokeKind::Inside);
+    }
+
+    if let Some(drag) = view.crop_drag {
+        let pending =
+            CellRect::from_corners(drag.start.0, drag.start.1, drag.end.0, drag.end.1)
+                .clamped(document.width, document.height);
+        if pending.w > 0 && pending.h > 0 {
+            let min = unclipped.min
+                + Vec2::new(
+                    pending.x as f32 * cell_pixel_w,
+                    pending.y as f32 * cell_pixel_h,
+                );
+            let size = Vec2::new(
+                pending.w as f32 * cell_pixel_w,
+                pending.h as f32 * cell_pixel_h,
+            );
+            let shape_rect = egui::Rect::from_min_size(min, size);
+            let clipped = shape_rect.intersect(draw_rect);
+            let painter = ui.painter_at(draw_rect);
+            painter.rect_filled(
+                clipped,
+                0.0,
+                Color32::from_rgba_unmultiplied(100, 255, 150, 30),
+            );
+            painter.rect_stroke(
+                clipped,
+                0.0,
+                Stroke::new(1.5, Color32::from_rgb(100, 255, 150)),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+
+    // Resize drag preview: signed coords, may extend past the current canvas
+    // into the viewport margins. Painter is clipped to `rect` (the full
+    // viewport area) instead of `draw_rect` (just the canvas) so the preview
+    // rect is visible past the canvas edges.
+    if let Some(drag) = view.resize_drag {
+        let x0 = drag.start.0.min(drag.end.0);
+        let y0 = drag.start.1.min(drag.end.1);
+        let x1 = drag.start.0.max(drag.end.0);
+        let y1 = drag.start.1.max(drag.end.1);
+        let min = unclipped.min
+            + Vec2::new(x0 as f32 * cell_pixel_w, y0 as f32 * cell_pixel_h);
+        let size = Vec2::new(
+            (x1 - x0 + 1) as f32 * cell_pixel_w,
+            (y1 - y0 + 1) as f32 * cell_pixel_h,
+        );
+        let shape_rect = egui::Rect::from_min_size(min, size);
+        let clipped = shape_rect.intersect(rect);
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(
+            clipped,
+            0.0,
+            Color32::from_rgba_unmultiplied(255, 180, 80, 30),
+        );
+        painter.rect_stroke(
+            clipped,
+            0.0,
+            Stroke::new(1.5, Color32::from_rgb(255, 200, 100)),
+            egui::StrokeKind::Inside,
+        );
     }
 
     // Paste ghost preview: stamp each clipboard cell at origin+(dx,dy) with
@@ -1085,12 +1280,11 @@ fn apply_pencil(
     y: u32,
     from: Option<(u32, u32)>,
 ) {
-    if x >= document.width || y >= document.height {
+    let layer = &document.layers[document.active_layer];
+    if !layer.in_bounds(x, y) {
         return;
     }
-    let existing_glyph = document.layers[document.active_layer]
-        .get(document.width, x, y)
-        .glyph;
+    let existing_glyph = layer.get(x, y).glyph;
     if !tools::shape_families::is_connected_glyph(existing_glyph) {
         view.pencil_stroke_fresh.insert((x, y));
     }

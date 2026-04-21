@@ -52,7 +52,7 @@ pub fn load_as_layer(path: &Path, canvas_w: u32, canvas_h: u32) -> Result<Layer>
                     bg: Color::BLACK,
                 }
             };
-            let idx = (y * canvas_w + x) as usize;
+            let idx = layer.idx(x, y);
             layer.tiles[idx] = tile;
         }
     }

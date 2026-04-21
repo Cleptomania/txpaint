@@ -15,6 +15,18 @@ pub struct Uniforms {
     pub _pad0: [u32; 2],
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Debug)]
+pub struct LayerUniforms {
+    /// Canvas-space cell at the layer's buffer origin (0, 0). Fragments sample
+    /// the layer at `canvas_cell - offset`.
+    pub offset: [i32; 2],
+    /// Layer buffer dimensions. Fragments outside `[0, layer_wh)` after the
+    /// offset translation are discarded, which is how small layers appear as
+    /// transparent outside their buffer and huge layers clip at the canvas edge.
+    pub layer_wh: [u32; 2],
+}
+
 /// Persistent wgpu state for the canvas renderer. One of these is created at
 /// startup and stored in `egui_wgpu::Renderer::callback_resources`.
 pub struct CanvasRenderResources {
@@ -29,7 +41,8 @@ pub struct CanvasRenderResources {
     pub font: Option<FontGpu>,
     pub global_bind_group: Option<wgpu::BindGroup>,
 
-    // Per-layer textures — rebuilt on resize or layer count change.
+    // Per-layer textures. Each layer owns its own (w, h), so textures are
+    // sized to the *layer* not the canvas.
     pub canvas_w: u32,
     pub canvas_h: u32,
     pub layers: Vec<LayerGpu>,
@@ -46,12 +59,17 @@ pub struct FontGpu {
 }
 
 pub struct LayerGpu {
+    /// Dimensions used when the textures were allocated. Compared against the
+    /// current layer's dims in `ensure` to decide whether to rebuild.
+    pub w: u32,
+    pub h: u32,
     pub glyph_tex: wgpu::Texture,
     pub glyph_view: wgpu::TextureView,
     pub fg_tex: wgpu::Texture,
     pub fg_view: wgpu::TextureView,
     pub bg_tex: wgpu::Texture,
     pub bg_view: wgpu::TextureView,
+    pub layer_uniform: wgpu::Buffer,
     pub bind_group: wgpu::BindGroup,
 }
 
@@ -124,6 +142,16 @@ impl CanvasRenderResources {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
                     count: None,
                 },
@@ -272,12 +300,21 @@ impl CanvasRenderResources {
         self.global_bind_group = Some(bind_group);
     }
 
-    fn rebuild_layers(&mut self, device: &wgpu::Device, w: u32, h: u32, layer_count: usize) {
-        self.canvas_w = w;
-        self.canvas_h = h;
+    /// Rebuild per-layer GPU state. Called when the layer count changes or
+    /// when `layout_generation` bumps (resize, font swap) — but also targeted
+    /// at individual layers whose dims no longer match their `LayerGpu` entry.
+    fn rebuild_layers(&mut self, device: &wgpu::Device, req: &CanvasRenderRequest) {
+        self.canvas_w = req.canvas_w;
+        self.canvas_h = req.canvas_h;
         self.layers.clear();
-        for i in 0..layer_count {
-            self.layers.push(make_layer_gpu(device, &self.layer_bgl, w, h, i));
+        for (i, layer_req) in req.layers.iter().enumerate() {
+            self.layers.push(make_layer_gpu(
+                device,
+                &self.layer_bgl,
+                layer_req.width,
+                layer_req.height,
+                i,
+            ));
         }
     }
 
@@ -286,49 +323,40 @@ impl CanvasRenderResources {
             self.rebuild_font(device, queue, req.atlas_w, req.atlas_h, &req.font_mask);
             self.last_font_generation = req.font_generation;
         }
-        if self.canvas_w != req.canvas_w
+        let layout_changed = self.canvas_w != req.canvas_w
             || self.canvas_h != req.canvas_h
             || self.layers.len() != req.layers.len()
-            || self.last_layout_generation != req.layout_generation
-        {
-            self.rebuild_layers(device, req.canvas_w, req.canvas_h, req.layers.len());
+            || self.last_layout_generation != req.layout_generation;
+        if layout_changed {
+            self.rebuild_layers(device, req);
             self.last_layout_generation = req.layout_generation;
+        } else {
+            // Layer count is unchanged, but individual layers can still be
+            // resized (crop). Rebuild just the mismatched slots.
+            for (i, layer_req) in req.layers.iter().enumerate() {
+                if self.layers[i].w != layer_req.width || self.layers[i].h != layer_req.height {
+                    self.layers[i] =
+                        make_layer_gpu(device, &self.layer_bgl, layer_req.width, layer_req.height, i);
+                }
+            }
         }
     }
 
-    fn upload_layer_full(
-        &self,
-        queue: &wgpu::Queue,
-        layer_index: usize,
-        tiles: &[Tile],
-        offset: (i32, i32),
-    ) {
+    fn upload_layer_full(&self, queue: &wgpu::Queue, layer_index: usize, tiles: &[Tile]) {
         let l = &self.layers[layer_index];
-        let w = self.canvas_w;
-        let h = self.canvas_h;
+        let w = l.w;
+        let h = l.h;
 
-        // Build a canvas-space view by sampling `tiles` (layer-buffer coords)
-        // at each canvas cell's shifted position. Cells whose source falls
-        // outside the layer buffer render as transparent so they don't leak
-        // stale content from a previous offset.
-        let (dx, dy) = offset;
+        // Layer textures are sized 1:1 to the layer buffer now — offset is
+        // applied by the shader, not baked into the upload — so this copies
+        // raw tile data in scan order.
         let mut glyphs = Vec::with_capacity((w * h) as usize);
         let mut fgs = Vec::with_capacity((w * h * 4) as usize);
         let mut bgs = Vec::with_capacity((w * h * 4) as usize);
-        let blank = Tile::default();
-        for cy in 0..h {
-            for cx in 0..w {
-                let lx = cx as i32 - dx;
-                let ly = cy as i32 - dy;
-                let t = if lx >= 0 && ly >= 0 && lx < w as i32 && ly < h as i32 {
-                    tiles[(ly as u32 * w + lx as u32) as usize]
-                } else {
-                    blank
-                };
-                glyphs.push(t.glyph);
-                fgs.extend_from_slice(&t.fg.0);
-                bgs.extend_from_slice(&t.bg.0);
-            }
+        for t in tiles.iter().take((w * h) as usize) {
+            glyphs.push(t.glyph);
+            fgs.extend_from_slice(&t.fg.0);
+            bgs.extend_from_slice(&t.bg.0);
         }
 
         let extent = wgpu::Extent3d {
@@ -383,38 +411,25 @@ impl CanvasRenderResources {
         );
     }
 
-    fn upload_cells(
-        &self,
-        queue: &wgpu::Queue,
-        layer_index: usize,
-        cells: &[(u32, u32, Tile)],
-        offset: (i32, i32),
-    ) {
+    fn upload_cells(&self, queue: &wgpu::Queue, layer_index: usize, cells: &[(u32, u32, Tile)]) {
         let l = &self.layers[layer_index];
         let one = wgpu::Extent3d {
             width: 1,
             height: 1,
             depth_or_array_layers: 1,
         };
-        let (dx, dy) = offset;
-        let cw = self.canvas_w as i32;
-        let ch = self.canvas_h as i32;
         for &(lx, ly, t) in cells {
-            // Translate layer-buffer coord → canvas coord and clip. Off-canvas
-            // edits simply leave the GPU texture alone; the layer buffer itself
-            // (in Document) still carries the change for when the layer is
-            // scrolled back into view.
-            let cx = lx as i32 + dx;
-            let cy = ly as i32 + dy;
-            if cx < 0 || cy < 0 || cx >= cw || cy >= ch {
+            // Coords are already layer-buffer coords — bounds-check against the
+            // layer texture size and drop anything stale (shouldn't happen now
+            // that we rebuild GPU textures on dim change, but cheap insurance).
+            if lx >= l.w || ly >= l.h {
                 continue;
             }
-            let (x, y) = (cx as u32, cy as u32);
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &l.glyph_tex,
                     mip_level: 0,
-                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    origin: wgpu::Origin3d { x: lx, y: ly, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
                 std::slice::from_ref(&t.glyph),
@@ -429,7 +444,7 @@ impl CanvasRenderResources {
                 wgpu::TexelCopyTextureInfo {
                     texture: &l.fg_tex,
                     mip_level: 0,
-                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    origin: wgpu::Origin3d { x: lx, y: ly, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
                 &t.fg.0,
@@ -444,7 +459,7 @@ impl CanvasRenderResources {
                 wgpu::TexelCopyTextureInfo {
                     texture: &l.bg_tex,
                     mip_level: 0,
-                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    origin: wgpu::Origin3d { x: lx, y: ly, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
                 &t.bg.0,
@@ -456,6 +471,15 @@ impl CanvasRenderResources {
                 one,
             );
         }
+    }
+
+    fn write_layer_uniform(&self, queue: &wgpu::Queue, layer_index: usize, req: &LayerRenderRequest) {
+        let l = &self.layers[layer_index];
+        let u = LayerUniforms {
+            offset: [req.offset.0, req.offset.1],
+            layer_wh: [l.w, l.h],
+        };
+        queue.write_buffer(&l.layer_uniform, 0, bytemuck::bytes_of(&u));
     }
 }
 
@@ -506,6 +530,15 @@ fn make_layer_gpu(
     let fg_view = fg_tex.create_view(&wgpu::TextureViewDescriptor::default());
     let bg_view = bg_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
+    let layer_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(&format!("txpaint.canvas.layer{index}.uniforms")),
+        contents: bytemuck::bytes_of(&LayerUniforms {
+            offset: [0, 0],
+            layer_wh: [w, h],
+        }),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(&format!("txpaint.canvas.layer{index}.bg_group")),
         layout,
@@ -522,15 +555,22 @@ fn make_layer_gpu(
                 binding: 2,
                 resource: wgpu::BindingResource::TextureView(&bg_view),
             },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: layer_uniform.as_entire_binding(),
+            },
         ],
     });
     LayerGpu {
+        w,
+        h,
         glyph_tex,
         glyph_view,
         fg_tex,
         fg_view,
         bg_tex,
         bg_view,
+        layer_uniform,
         bind_group,
     }
 }
@@ -547,17 +587,20 @@ pub struct CanvasRenderRequest {
     pub layout_generation: u64,
     pub cell_origin: [f32; 2],
     pub cell_span: [f32; 2],
-    /// Per-layer data. A `full_tiles` Some value means do a full re-upload; dirty
-    /// cells are always applied on top (typically you'd use one or the other).
+    /// Per-layer data. A `full_tiles` Some value means do a full re-upload;
+    /// dirty cells are always applied on top (typically one or the other).
     pub layers: Vec<LayerRenderRequest>,
 }
 
 pub struct LayerRenderRequest {
     pub visible: bool,
-    /// Display shift: the layer's buffer cell (lx, ly) is rendered at canvas
-    /// cell (lx + offset.0, ly + offset.1). `full_tiles` carries layer-buffer
-    /// content as-is; the upload path builds the shifted canvas-space view
-    /// from it. `dirty_cells` positions are in layer-buffer coords too.
+    /// Layer's own buffer dims. Per-frame snapshot so the renderer can detect
+    /// crop/resize and rebuild GPU textures.
+    pub width: u32,
+    pub height: u32,
+    /// Display shift: `offset` in canvas cells. The shader computes the layer
+    /// buffer cell as `canvas_cell - offset` and discards fragments outside
+    /// `[0, layer_wh)`.
     pub offset: (i32, i32),
     pub full_tiles: Option<Arc<Vec<Tile>>>,
     pub dirty_cells: Vec<(u32, u32, Tile)>,
@@ -587,12 +630,14 @@ impl CanvasRenderRequest {
             let mut dirty_cells = Vec::with_capacity(layer.dirty_cells.len());
             if full_tiles.is_none() {
                 for (x, y) in layer.dirty_cells.drain() {
-                    let idx = (y * document.width + x) as usize;
+                    let idx = (y * layer.width + x) as usize;
                     dirty_cells.push((x, y, layer.tiles[idx]));
                 }
             }
             layers.push(LayerRenderRequest {
                 visible: layer.visible,
+                width: layer.width,
+                height: layer.height,
                 offset: layer.offset,
                 full_tiles,
                 dirty_cells,
@@ -641,11 +686,12 @@ impl egui_wgpu::CallbackTrait for CanvasCallback {
         queue.write_buffer(&res.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         for (i, layer_req) in self.request.layers.iter().enumerate() {
+            res.write_layer_uniform(queue, i, layer_req);
             if let Some(tiles) = &layer_req.full_tiles {
-                res.upload_layer_full(queue, i, tiles.as_slice(), layer_req.offset);
+                res.upload_layer_full(queue, i, tiles.as_slice());
             }
             if !layer_req.dirty_cells.is_empty() {
-                res.upload_cells(queue, i, &layer_req.dirty_cells, layer_req.offset);
+                res.upload_cells(queue, i, &layer_req.dirty_cells);
             }
         }
         Vec::new()

@@ -14,6 +14,8 @@ pub enum ToolKind {
     Line,
     Rectangle,
     Move,
+    Crop,
+    Resize,
     Text,
 }
 
@@ -25,6 +27,8 @@ impl ToolKind {
             ToolKind::Line => "Line",
             ToolKind::Rectangle => "Rectangle",
             ToolKind::Move => "Move",
+            ToolKind::Crop => "Crop",
+            ToolKind::Resize => "Resize",
             ToolKind::Text => "Text",
         }
     }
@@ -38,6 +42,8 @@ impl ToolKind {
             ToolKind::Line => "L",
             ToolKind::Rectangle => "R",
             ToolKind::Move => "V",
+            ToolKind::Crop => "C",
+            ToolKind::Resize => "N",
             ToolKind::Text => "T",
         }
     }
@@ -58,6 +64,19 @@ impl ToolKind {
             ToolKind::Move => {
                 "Drag the active layer to reposition it. Cells that scroll \
                  off-canvas stay in the layer buffer and return when dragged back."
+            }
+            ToolKind::Crop => {
+                "Drag a rectangle to resize the active layer's buffer to just \
+                 that region. Useful for trimming a layer imported larger \
+                 than the canvas, or shrinking a layer down to its drawn \
+                 extent. Undoable."
+            }
+            ToolKind::Resize => {
+                "Drag a rectangle to set the new canvas extent. The rectangle \
+                 can extend past the current canvas into the viewport's empty \
+                 margins to grow it, or sit inside the canvas to shrink it. \
+                 Layer buffers are untouched; their offsets shift so existing \
+                 content stays in the same absolute position. Undoable."
             }
             ToolKind::Text => {
                 "Click a cell to place a caret, then type to write text. \
@@ -187,7 +206,8 @@ pub fn apply_pencil_cell(
     from: Option<(u32, u32)>,
     fresh_cells: &HashSet<(u32, u32)>,
 ) {
-    if x >= document.width || y >= document.height {
+    let layer_index = document.active_layer;
+    if !document.layers[layer_index].in_bounds(x, y) {
         return;
     }
     // All three channel toggles off → nothing to write. Skip dynamic-mode
@@ -198,13 +218,11 @@ pub fn apply_pencil_cell(
     {
         return;
     }
-    let w = document.width;
-    let layer_index = document.active_layer;
     match document.pencil_mode {
         PencilMode::Simple => {
-            let existing = document.layers[layer_index].get(w, x, y);
+            let existing = document.layers[layer_index].get(x, y);
             let new_tile = pencil_tile(document, existing, document.selected_glyph);
-            write_cell(document, history, layer_index, w, x, y, new_tile);
+            write_cell(document, history, layer_index, x, y, new_tile);
         }
         PencilMode::Dynamic => {
             let selected = document.selected_glyph;
@@ -216,9 +234,9 @@ pub fn apply_pencil_cell(
             } else {
                 // Non-box glyph or glyph channel disabled: degrade to a
                 // per-channel-gated literal write of the center cell.
-                let existing = document.layers[layer_index].get(w, x, y);
+                let existing = document.layers[layer_index].get(x, y);
                 let new_tile = pencil_tile(document, existing, selected);
-                write_cell(document, history, layer_index, w, x, y, new_tile);
+                write_cell(document, history, layer_index, x, y, new_tile);
             }
         }
     }
@@ -250,7 +268,6 @@ fn write_dynamic_cell(
 ) {
     use shape_families::{ConnectionPattern, LineStyle, Side};
 
-    let w = document.width;
     let layer_index = document.active_layer;
     let selected = document.selected_glyph;
     let stroke_fam = shape_families::stroke_family(selected);
@@ -260,7 +277,7 @@ fn write_dynamic_cell(
     // then override slots where a neighbor actively presents a family on
     // that side. (We don't override with `None` — a box neighbor that
     // doesn't face us shouldn't erase an existing slot.)
-    let current_glyph = document.layers[layer_index].get(w, x, y).glyph;
+    let current_glyph = document.layers[layer_index].get(x, y).glyph;
     let mut pattern =
         shape_families::glyph_to_pattern(current_glyph).unwrap_or(ConnectionPattern::EMPTY);
     for side in Side::ALL {
@@ -292,9 +309,9 @@ fn write_dynamic_cell(
         .or_else(|| shape_families::pattern_to_glyph(shape_families::coerce_to_family(pattern, stroke_fam)))
         .unwrap_or(selected);
 
-    let existing = document.layers[layer_index].get(w, x, y);
+    let existing = document.layers[layer_index].get(x, y);
     let new_tile = pencil_tile(document, existing, glyph);
-    write_cell(document, history, layer_index, w, x, y, new_tile);
+    write_cell(document, history, layer_index, x, y, new_tile);
 
     // For neighbor refresh we advertise the written glyph's canonical
     // pattern. This is what makes cross-family work: writing 179 above an
@@ -303,14 +320,18 @@ fn write_dynamic_cell(
     // arms of a stub glyph so adjacent pre-existing lines merge in.
     let our_canonical = shape_families::glyph_to_pattern(glyph).unwrap_or(pattern);
 
+    let (lw, lh) = {
+        let layer = &document.layers[layer_index];
+        (layer.width, layer.height)
+    };
     for side in Side::ALL {
         let (nx, ny) = side.step(x, y);
-        if nx < 0 || ny < 0 || nx >= document.width as i32 || ny >= document.height as i32 {
+        if nx < 0 || ny < 0 || nx >= lw as i32 || ny >= lh as i32 {
             continue;
         }
         let nx = nx as u32;
         let ny = ny as u32;
-        let n_glyph = document.layers[layer_index].get(w, nx, ny).glyph;
+        let n_glyph = document.layers[layer_index].get(nx, ny).glyph;
         let Some(n_pattern) = shape_families::glyph_to_pattern(n_glyph) else {
             continue;
         };
@@ -335,13 +356,13 @@ fn write_dynamic_cell(
         if new_glyph == n_glyph {
             continue;
         }
-        let existing = document.layers[layer_index].get(w, nx, ny);
+        let existing = document.layers[layer_index].get(nx, ny);
         let new_tile = Tile {
             glyph: new_glyph,
             fg: existing.fg,
             bg: existing.bg,
         };
-        write_cell(document, history, layer_index, w, nx, ny, new_tile);
+        write_cell(document, history, layer_index, nx, ny, new_tile);
     }
 }
 
@@ -359,6 +380,12 @@ fn rederive_pattern(document: &Document, x: u32, y: u32) -> shape_families::Conn
         }
     }
     pattern
+}
+
+/// Active layer's buffer dims — shorthand for bounds checks below.
+fn active_layer_wh(document: &Document) -> (u32, u32) {
+    let layer = &document.layers[document.active_layer];
+    (layer.width, layer.height)
 }
 
 /// Which side of `(x, y)` faces `(fx, fy)`? `None` if the two cells are not
@@ -386,12 +413,12 @@ fn neighbor_facing_if_family(
     side: shape_families::Side,
 ) -> Option<shape_families::LineStyle> {
     let (nx, ny) = side.step(x, y);
-    if nx < 0 || ny < 0 || nx >= document.width as i32 || ny >= document.height as i32 {
+    let (lw, lh) = active_layer_wh(document);
+    if nx < 0 || ny < 0 || nx >= lw as i32 || ny >= lh as i32 {
         return None;
     }
-    let w = document.width;
     let n_glyph = document.layers[document.active_layer]
-        .get(w, nx as u32, ny as u32)
+        .get(nx as u32, ny as u32)
         .glyph;
     let n_pattern = shape_families::glyph_to_pattern(n_glyph)?;
     Some(n_pattern.get(side.opposite()))
@@ -431,20 +458,23 @@ fn run_on_selection(
         return;
     }
     let new_tile = make_tile(document);
-    let w = document.width;
-    let h = document.height;
     let layer_index = document.active_layer;
     let (dx, dy) = document.layers[layer_index].offset;
+    let (lw, lh) = {
+        let layer = &document.layers[layer_index];
+        (layer.width, layer.height)
+    };
     history.begin_stroke();
     for (cx, cy) in cells {
-        // Selection is in canvas space; the active layer may be offset, so
-        // translate each cell to the layer's buffer coordinate before writing.
+        // Selection is in canvas space; the active layer may be offset and
+        // sized independently of the canvas, so translate each cell to the
+        // layer's buffer coordinate and bounds-check against the layer dims.
         let lx = cx as i32 - dx;
         let ly = cy as i32 - dy;
-        if lx < 0 || ly < 0 || lx >= w as i32 || ly >= h as i32 {
+        if lx < 0 || ly < 0 || lx >= lw as i32 || ly >= lh as i32 {
             continue;
         }
-        write_cell(document, history, layer_index, w, lx as u32, ly as u32, new_tile);
+        write_cell(document, history, layer_index, lx as u32, ly as u32, new_tile);
     }
     history.end_stroke();
 }
@@ -567,17 +597,21 @@ pub fn commit_rectangle(
     }
     let layer_index = document.active_layer;
     let (dx, dy) = document.layers[layer_index].offset;
+    let (lw, lh) = {
+        let layer = &document.layers[layer_index];
+        (layer.width, layer.height)
+    };
     let fg = document.fg;
     let bg = document.bg;
     let selected = document.selected_glyph;
     for (cx, cy, glyph) in rectangle_cell_glyphs(rect, mode, selected) {
         let lx = cx as i32 - dx;
         let ly = cy as i32 - dy;
-        if lx < 0 || ly < 0 || lx >= cw as i32 || ly >= ch as i32 {
+        if lx < 0 || ly < 0 || lx >= lw as i32 || ly >= lh as i32 {
             continue;
         }
         let new_tile = Tile { glyph, fg, bg };
-        write_cell(document, history, layer_index, cw, lx as u32, ly as u32, new_tile);
+        write_cell(document, history, layer_index, lx as u32, ly as u32, new_tile);
     }
 }
 
@@ -642,16 +676,18 @@ fn write_text_tile(
     y: u32,
     tile: Tile,
 ) {
-    let w = document.width;
-    let h = document.height;
     let layer_index = document.active_layer;
     let (dx, dy) = document.layers[layer_index].offset;
+    let (lw, lh) = {
+        let layer = &document.layers[layer_index];
+        (layer.width, layer.height)
+    };
     let lx = x as i32 - dx;
     let ly = y as i32 - dy;
-    if lx < 0 || ly < 0 || lx >= w as i32 || ly >= h as i32 {
+    if lx < 0 || ly < 0 || lx >= lw as i32 || ly >= lh as i32 {
         return;
     }
-    write_cell(document, history, layer_index, w, lx as u32, ly as u32, tile);
+    write_cell(document, history, layer_index, lx as u32, ly as u32, tile);
 }
 
 /// Commit a line stroke between two canvas cells using the active
@@ -665,10 +701,12 @@ pub fn commit_line(
     start: (u32, u32),
     end: (u32, u32),
 ) {
-    let w = document.width;
-    let h = document.height;
     let layer_index = document.active_layer;
     let (dx, dy) = document.layers[layer_index].offset;
+    let (lw, lh) = {
+        let layer = &document.layers[layer_index];
+        (layer.width, layer.height)
+    };
     let new_tile = Tile {
         glyph: document.selected_glyph,
         fg: document.fg,
@@ -677,10 +715,10 @@ pub fn commit_line(
     for (cx, cy) in bresenham_cells(start.0 as i32, start.1 as i32, end.0 as i32, end.1 as i32) {
         let lx = cx - dx;
         let ly = cy - dy;
-        if lx < 0 || ly < 0 || lx >= w as i32 || ly >= h as i32 {
+        if lx < 0 || ly < 0 || lx >= lw as i32 || ly >= lh as i32 {
             continue;
         }
-        write_cell(document, history, layer_index, w, lx as u32, ly as u32, new_tile);
+        write_cell(document, history, layer_index, lx as u32, ly as u32, new_tile);
     }
 }
 
@@ -688,7 +726,6 @@ fn write_cell(
     document: &mut Document,
     history: &mut History,
     layer_index: usize,
-    w: u32,
     x: u32,
     y: u32,
     new_tile: Tile,
@@ -696,11 +733,14 @@ fn write_cell(
     let Some(layer) = document.layers.get_mut(layer_index) else {
         return;
     };
-    let before = layer.get(w, x, y);
+    if !layer.in_bounds(x, y) {
+        return;
+    }
+    let before = layer.get(x, y);
     if before == new_tile {
         return;
     }
-    layer.set(w, x, y, new_tile);
+    layer.set(x, y, new_tile);
     history.record(CellChange {
         layer: layer_index,
         x,
@@ -760,7 +800,6 @@ impl Clipboard {
 /// new `Clipboard`. Returns `None` if there is no active selection.
 pub fn copy_selection(document: &Document) -> Option<Clipboard> {
     let mask = document.selection.as_ref()?;
-    let w = document.width;
     let mut min_x = u32::MAX;
     let mut min_y = u32::MAX;
     let mut max_x = 0u32;
@@ -777,12 +816,21 @@ pub fn copy_selection(document: &Document) -> Option<Clipboard> {
         return None;
     }
     let layer = document.layers.get(document.active_layer)?;
+    let (dx, dy) = layer.offset;
     let mut cells = Vec::new();
     for (x, y) in mask.iter_cells() {
+        // Selection is canvas-space; translate each cell to the active
+        // layer's buffer before sampling. Cells that miss the layer buffer
+        // are skipped so the clipboard only carries real tile data.
+        let lx = x as i32 - dx;
+        let ly = y as i32 - dy;
+        if lx < 0 || ly < 0 || lx >= layer.width as i32 || ly >= layer.height as i32 {
+            continue;
+        }
         cells.push(ClipCell {
             dx: x - min_x,
             dy: y - min_y,
-            tile: layer.get(w, x, y),
+            tile: layer.get(lx as u32, ly as u32),
         });
     }
     Some(Clipboard {
@@ -821,10 +869,10 @@ pub fn commit_paste(
         for (cdx, cdy, tile) in clipboard.iter_flipped(flip_h, flip_v) {
             let x = origin_x.saturating_add(cdx);
             let y = origin_y.saturating_add(cdy);
-            if x >= cw || y >= ch {
+            if !layer.in_bounds(x, y) {
                 continue;
             }
-            layer.set(cw, x, y, tile);
+            layer.set(x, y, tile);
         }
         let index = document.layers.len();
         document.layers.push(layer.clone());
@@ -834,17 +882,122 @@ pub fn commit_paste(
     } else {
         let layer_index = document.active_layer;
         let (dx, dy) = document.layers[layer_index].offset;
+        let (lw, lh) = {
+            let layer = &document.layers[layer_index];
+            (layer.width, layer.height)
+        };
         history.begin_stroke();
         for (cdx, cdy, tile) in clipboard.iter_flipped(flip_h, flip_v) {
             let cx = origin_x as i32 + cdx as i32;
             let cy = origin_y as i32 + cdy as i32;
             let lx = cx - dx;
             let ly = cy - dy;
-            if lx < 0 || ly < 0 || lx >= cw as i32 || ly >= ch as i32 {
+            if lx < 0 || ly < 0 || lx >= lw as i32 || ly >= lh as i32 {
                 continue;
             }
-            write_cell(document, history, layer_index, cw, lx as u32, ly as u32, tile);
+            write_cell(document, history, layer_index, lx as u32, ly as u32, tile);
         }
         history.end_stroke();
     }
+}
+
+/// Resize the canvas so its new extent matches `rect` (expressed in the
+/// current canvas-space; the rectangle's origin can be negative and its
+/// corners can lie past the old canvas edges). Layer buffers are untouched:
+/// each layer's display offset is shifted by `-(rect.x, rect.y)` so content
+/// stays put in absolute coordinates while the canvas origin moves to
+/// `rect.top_left`. Undoable via `Command::ResizeCanvas`.
+pub fn commit_resize(
+    document: &mut Document,
+    history: &mut History,
+    rect_origin: (i32, i32),
+    rect_size: (u32, u32),
+) {
+    let (rx, ry) = rect_origin;
+    let (rw, rh) = rect_size;
+    if rw == 0 || rh == 0 {
+        return;
+    }
+    let before = (document.width, document.height);
+    let after = (rw, rh);
+    let offset_delta = (-rx, -ry);
+    if before == after && offset_delta == (0, 0) {
+        return;
+    }
+    document.width = rw;
+    document.height = rh;
+    for layer in &mut document.layers {
+        layer.offset.0 += offset_delta.0;
+        layer.offset.1 += offset_delta.1;
+    }
+    // Clear any selection — its coords are canvas-space and the origin has
+    // potentially shifted; the cells it covered are no longer necessarily
+    // what the user thinks of as selected.
+    document.selection = None;
+    document.bump_resources();
+    history.push(Command::ResizeCanvas {
+        before,
+        after,
+        offset_delta,
+    });
+}
+
+/// Crop the active layer's buffer to exactly `rect` (canvas-space). The new
+/// layer's `offset` becomes `(rect.x, rect.y)` so the cropped content renders
+/// where it did before, and its buffer dims become `(rect.w, rect.h)`. Tiles
+/// inside the overlap with the old layer are preserved; everything else is
+/// blank. A `ReplaceLayer` command is pushed so the crop is undoable.
+///
+/// `rect.x`/`rect.y` are signed because a user can drag in canvas-space and
+/// the canvas itself doesn't extend below (0, 0) — but the rect *can* because
+/// `layer.offset` already does, and the crop rect is effectively a new offset.
+/// This accepts a signed origin to stay symmetric with `layer.offset`.
+pub fn commit_crop(
+    document: &mut Document,
+    history: &mut History,
+    rect_origin: (i32, i32),
+    rect_size: (u32, u32),
+) {
+    let (rx, ry) = rect_origin;
+    let (rw, rh) = rect_size;
+    if rw == 0 || rh == 0 {
+        return;
+    }
+    let layer_index = document.active_layer;
+    let before = document.layers[layer_index].clone();
+    let no_op_same_dims = before.width == rw
+        && before.height == rh
+        && before.offset == (rx, ry);
+    if no_op_same_dims {
+        return;
+    }
+    let mut after = Layer::new(before.name.clone(), rw, rh);
+    after.visible = before.visible;
+    after.offset = (rx, ry);
+    // Sample the old layer at each new-buffer cell's canvas coord, translated
+    // through the old offset. Cells with no coverage stay as the default
+    // blank tile (transparent bg + glyph 0).
+    let (ox, oy) = before.offset;
+    for ny in 0..rh {
+        for nx in 0..rw {
+            let cx = rx + nx as i32;
+            let cy = ry + ny as i32;
+            let bx = cx - ox;
+            let by = cy - oy;
+            if bx < 0 || by < 0 || bx >= before.width as i32 || by >= before.height as i32 {
+                continue;
+            }
+            let tile = before.get(bx as u32, by as u32);
+            after.set(nx, ny, tile);
+        }
+    }
+    after.full_upload = true;
+    after.dirty_cells.clear();
+    document.layers[layer_index] = after.clone();
+    document.bump_resources();
+    history.push(Command::ReplaceLayer {
+        index: layer_index,
+        before,
+        after,
+    });
 }

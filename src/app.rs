@@ -105,6 +105,7 @@ fn handle_global_shortcuts(
                             ui_state.canvas_view.select_drag = None;
                             ui_state.canvas_view.line_drag = None;
                             ui_state.canvas_view.rect_drag = None;
+                            ui_state.canvas_view.crop_drag = None;
                             ui_state.canvas_view.paste_preview =
                                 Some(PastePreview::default());
                         }
@@ -119,6 +120,8 @@ fn handle_global_shortcuts(
                 || i.key_pressed(egui::Key::L)
                 || i.key_pressed(egui::Key::R)
                 || i.key_pressed(egui::Key::V)
+                || i.key_pressed(egui::Key::C)
+                || i.key_pressed(egui::Key::N)
                 || i.key_pressed(egui::Key::T);
             if tool_key {
                 ui_state.canvas_view.paste_preview = None;
@@ -137,6 +140,12 @@ fn handle_global_shortcuts(
             }
             if i.key_pressed(egui::Key::V) {
                 document.active_tool = ToolKind::Move;
+            }
+            if i.key_pressed(egui::Key::C) {
+                document.active_tool = ToolKind::Crop;
+            }
+            if i.key_pressed(egui::Key::N) {
+                document.active_tool = ToolKind::Resize;
             }
             if i.key_pressed(egui::Key::T) {
                 document.active_tool = ToolKind::Text;

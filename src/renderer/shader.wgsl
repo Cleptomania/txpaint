@@ -9,6 +9,16 @@ struct Uniforms {
     _pad0: vec2<u32>,
 };
 
+struct LayerUniforms {
+    // Canvas-space cell at the layer's buffer origin. Buffer cell =
+    // canvas_cell - offset. Layers can be positioned partly or fully off the
+    // canvas; discard below handles both the canvas viewport and layer bounds.
+    offset: vec2<i32>,
+    // Layer buffer size in cells. Used for the per-layer bounds discard so
+    // layers smaller than the canvas draw as transparent outside their buffer.
+    layer_wh: vec2<u32>,
+};
+
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var font_tex: texture_2d<f32>;
 @group(0) @binding(2) var font_samp: sampler;
@@ -16,6 +26,7 @@ struct Uniforms {
 @group(1) @binding(0) var glyph_tex: texture_2d<u32>;
 @group(1) @binding(1) var fg_tex: texture_2d<f32>;
 @group(1) @binding(2) var bg_tex: texture_2d<f32>;
+@group(1) @binding(3) var<uniform> layer: LayerUniforms;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -42,16 +53,26 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let cell_fpos = u.cell_origin + in.uv * u.cell_span;
-    let wh = vec2<f32>(u.canvas_wh);
-    // Reject fragments that fall outside the canvas bounds — happens when the
-    // view is panned so the viewport extends past the canvas edge.
-    if cell_fpos.x < 0.0 || cell_fpos.y < 0.0
-        || cell_fpos.x >= wh.x || cell_fpos.y >= wh.y {
+    let canvas_fpos = u.cell_origin + in.uv * u.cell_span;
+    let canvas_wh = vec2<f32>(u.canvas_wh);
+    // Reject fragments outside the canvas bounds — happens when the view is
+    // panned past the canvas edge, or for layer content that extends past it.
+    if canvas_fpos.x < 0.0 || canvas_fpos.y < 0.0
+        || canvas_fpos.x >= canvas_wh.x || canvas_fpos.y >= canvas_wh.y {
         discard;
     }
-    let cell = vec2<u32>(clamp(cell_fpos, vec2<f32>(0.0), wh - vec2<f32>(0.001)));
-    let in_cell = fract(cell_fpos);
+    // Translate canvas-space cell to layer-buffer cell, then clip to the
+    // layer's own extent. Layers smaller than the canvas (or offset so that
+    // part of the canvas lies outside the buffer) draw as transparent in the
+    // out-of-buffer region so lower layers show through.
+    let layer_fpos = canvas_fpos - vec2<f32>(layer.offset);
+    let layer_wh = vec2<f32>(layer.layer_wh);
+    if layer_fpos.x < 0.0 || layer_fpos.y < 0.0
+        || layer_fpos.x >= layer_wh.x || layer_fpos.y >= layer_wh.y {
+        discard;
+    }
+    let cell = vec2<u32>(clamp(layer_fpos, vec2<f32>(0.0), layer_wh - vec2<f32>(0.001)));
+    let in_cell = fract(layer_fpos);
 
     let glyph = textureLoad(glyph_tex, vec2<i32>(cell), 0).r;
     let fg = textureLoad(fg_tex, vec2<i32>(cell), 0);

@@ -45,6 +45,15 @@ pub fn load_from_path(path: &Path) -> Result<Document> {
     read(&mut decoder)
 }
 
+/// Load just the layers (and their native dimensions) from an `.xp` file,
+/// without constructing a Document. Used by "Import XP as Layers…" which
+/// appends these layers onto an existing document.
+pub fn load_layers_from_path(path: &Path) -> Result<(u32, u32, Vec<Layer>)> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut decoder = GzDecoder::new(file);
+    read_layers(&mut decoder)
+}
+
 pub fn write<W: Write>(w: &mut W, document: &Document) -> Result<()> {
     w.write_i32::<LittleEndian>(XP_VERSION)?;
     w.write_i32::<LittleEndian>(document.layers.len() as i32)?;
@@ -53,19 +62,26 @@ pub fn write<W: Write>(w: &mut W, document: &Document) -> Result<()> {
     let ch = document.height;
     let blank = Tile::default();
     for layer in &document.layers {
+        // Save is WYSIWYG at canvas size: each layer is written as a
+        // canvas-sized tile grid with the display offset baked into
+        // coordinates. Content whose buffer coord maps outside the canvas
+        // after the shift is dropped (the .xp format has no per-layer offset
+        // concept). This is consistent across mixed-size layers too: the
+        // layer's own `width/height` bound its buffer lookup, and the canvas
+        // dims bound what gets written to disk.
         w.write_i32::<LittleEndian>(cw as i32)?;
         w.write_i32::<LittleEndian>(ch as i32)?;
-        // Save is WYSIWYG: bake each layer's display offset into its saved
-        // cell positions. Content whose buffer coord maps outside the canvas
-        // after the shift is simply not included (the .xp format has no
-        // per-layer offset concept). The in-memory layer is unchanged.
         let (dx, dy) = layer.offset;
         for x in 0..cw {
             for y in 0..ch {
                 let lx = x as i32 - dx;
                 let ly = y as i32 - dy;
-                let t = if lx >= 0 && ly >= 0 && lx < cw as i32 && ly < ch as i32 {
-                    layer.tiles[(ly as u32 * cw + lx as u32) as usize]
+                let t = if lx >= 0
+                    && ly >= 0
+                    && lx < layer.width as i32
+                    && ly < layer.height as i32
+                {
+                    layer.tiles[(ly as u32 * layer.width + lx as u32) as usize]
                 } else {
                     blank
                 };
@@ -83,12 +99,27 @@ pub fn write<W: Write>(w: &mut W, document: &Document) -> Result<()> {
 }
 
 pub fn read<R: Read>(r: &mut R) -> Result<Document> {
+    let (width, height, layers) = read_layers(r)?;
+    let mut document = Document::new_default();
+    document.width = width;
+    document.height = height;
+    document.layers = layers;
+    document.active_layer = 0;
+    document.bump_resources();
+    Ok(document)
+}
+
+pub fn read_layers<R: Read>(r: &mut R) -> Result<(u32, u32, Vec<Layer>)> {
     let _version = r.read_i32::<LittleEndian>()?;
     let num_layers = r.read_i32::<LittleEndian>()?;
     if num_layers <= 0 || num_layers > 64 {
         return Err(anyhow!("unreasonable num_layers: {num_layers}"));
     }
 
+    // Layers may have different sizes in txpaint now. The canvas dims still
+    // come from the first layer (matches REXPaint's "all layers same size"
+    // assumption for legacy files), but subsequent layers keep their native
+    // dims so "Import XP as Layers…" doesn't clip oversized layers.
     let mut width: u32 = 0;
     let mut height: u32 = 0;
     let mut layers: Vec<Layer> = Vec::with_capacity(num_layers as usize);
@@ -105,10 +136,6 @@ pub fn read<R: Read>(r: &mut R) -> Result<Document> {
         if layer_i == 0 {
             width = w;
             height = h;
-        } else if w != width || h != height {
-            return Err(anyhow!(
-                "layer {layer_i} has inconsistent size {w}x{h} (expected {width}x{height})"
-            ));
         }
 
         let mut tiles = vec![Tile::default(); (w * h) as usize];
@@ -136,11 +163,5 @@ pub fn read<R: Read>(r: &mut R) -> Result<Document> {
         layers.push(layer);
     }
 
-    let mut document = Document::new_default();
-    document.width = width;
-    document.height = height;
-    document.layers = layers;
-    document.active_layer = 0;
-    document.bump_resources();
-    Ok(document)
+    Ok((width, height, layers))
 }

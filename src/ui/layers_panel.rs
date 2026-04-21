@@ -177,12 +177,10 @@ pub fn show(
             }
             LayerAction::MergeDown(i) => {
                 if i > 0 && i < document.layers.len() {
-                    let w = document.width;
-                    let h = document.height;
                     let (low, high) = document.layers.split_at_mut(i);
                     let top = &high[0];
                     let bottom = &mut low[i - 1];
-                    bottom.merge_from_above(top, w, h);
+                    bottom.merge_from_above(top);
                     document.layers.remove(i);
                     if document.active_layer == i {
                         document.active_layer = i - 1;

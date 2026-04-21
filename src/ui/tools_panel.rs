@@ -21,7 +21,8 @@ pub fn show(
                 ],
             ),
             ("Selection Tools", &[ToolKind::Select]),
-            ("Layer Tools", &[ToolKind::Move]),
+            ("Layer Tools", &[ToolKind::Move, ToolKind::Crop]),
+            ("Canvas Tools", &[ToolKind::Resize]),
         ];
         for (title, tools) in CATEGORIES {
             ui.heading(*title);

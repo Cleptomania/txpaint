@@ -18,7 +18,7 @@ txpaint is a CP437 tile paint program. egui renders all panels (menu, tools, gly
 ### Data flow
 
 - `Document` (`src/document.rs`) owns `layers: Vec<Layer>`, the active `FontAtlas`, palettes, fg/bg colors, selected glyph, active tool, and a `resources_generation` counter.
-- `Layer` (`src/layer.rs`) holds row-major `tiles: Vec<Tile>` plus a `dirty_cells` set and a `full_upload: bool` flag. Editing calls `layer.set(w, x, y, tile)` which compares and marks the cell dirty.
+- `Layer` (`src/layer.rs`) owns its own `width`/`height` — buffers are sized to the *layer*, not the canvas, so a layer can be larger or smaller than `document.width × document.height`. It holds row-major `tiles: Vec<Tile>` plus a `dirty_cells` set and a `full_upload: bool` flag. Editing calls `layer.set(x, y, tile)` (the older `layer.set(w, …)` signature is gone). `layer.offset` is a display shift in canvas cells; the shader applies it per-layer so moving a layer is just a uniform rewrite, no re-upload.
 - `Tile { glyph: u8, fg: Color, bg: Color }` — `bg == TRANSPARENT_BG` (`(255, 0, 255)`) means the cell is transparent.
 - Each frame, `CanvasRenderRequest::from_document` drains per-layer dirty cells and snapshots full tile buffers only when `layer.full_upload` is set. Call `Document::bump_resources()` (not `resources_generation += 1` directly) whenever the canvas size, layer count, or font changes — it also forces `full_upload = true` on every layer so the new GPU textures get reseeded.
 
@@ -28,6 +28,7 @@ txpaint is a CP437 tile paint program. egui renders all panels (menu, tools, gly
 - `CanvasCallback` is constructed each frame with a `CanvasRenderRequest` snapshot. `prepare` rebuilds font/layer GPU resources if generations changed, applies `full_tiles` uploads or per-cell `dirty_cells` writes, and updates the uniform buffer. `paint` draws one `draw(0..6)` call per visible layer with `BlendState::ALPHA_BLENDING` so transparent cells reveal lower layers.
 - The shader (`src/renderer/shader.wgsl`) emits a fixed full-viewport quad `(NDC -1..1)`. egui-wgpu sets the render-pass viewport to the paint-callback rect, so NDC already maps to the draw area — **do not** try to compute a sub-NDC rect for the canvas or sampling will be off-by-offset. UV is y-down (0,0 = top-left).
 - Pan/zoom is expressed as `cell_origin + uv * cell_span` in the shader, where `cell_origin` is the canvas cell at the viewport's top-left (can be fractional). Canvas_view computes those from `(draw_rect - unclipped) / cell_pixel_size`. Fragments with `cell_fpos` outside `[0, canvas_wh)` are discarded, which handles panning the viewport past the canvas edge.
+- Per-layer dimensions and offset live in a small UBO at `@group(1) @binding(3)` (see `LayerUniforms`). The fragment shader does two discards: the canvas-viewport one, then a second `canvas_cell − layer.offset` translation plus `[0, layer_wh)` bounds check so layers smaller than the canvas draw transparent outside their buffer and larger ones clip at the canvas edge. Layer textures are allocated at each layer's own dims; the renderer rebuilds a single `LayerGpu` slot when only that layer's size changed (crop), and does a full rebuild on layer-count change or `resources_generation` bump.
 
 ### UI (`src/ui/`)
 
