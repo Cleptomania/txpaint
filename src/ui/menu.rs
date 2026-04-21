@@ -3,14 +3,15 @@ use std::path::PathBuf;
 use egui::Modifiers;
 
 use crate::document::Document;
-use crate::history::History;
-use crate::io::{font_import, xp};
+use crate::history::{Command, History};
+use crate::io::{font_import, png_import, xp};
 use crate::ui::async_dialog::PendingFile;
 
 enum PendingOp {
     Open(PendingFile),
     Save { to: Option<PathBuf>, dialog: PendingFile },
     ImportFont(PendingFile),
+    ImportPngLayer(PendingFile),
 }
 
 pub struct MenuState {
@@ -75,6 +76,13 @@ pub fn show(
             if ui.button("Import Font…").clicked() {
                 state.pending = Some(PendingOp::ImportFont(PendingFile::load(
                     "PNG font",
+                    &["png"],
+                )));
+                ui.close();
+            }
+            if ui.button("Import PNG as Layer…").clicked() {
+                state.pending = Some(PendingOp::ImportPngLayer(PendingFile::load(
+                    "PNG",
                     &["png"],
                 )));
                 ui.close();
@@ -237,7 +245,7 @@ fn drain_pending(document: &mut Document, history: &mut History, state: &mut Men
         return;
     };
     let file = match op {
-        PendingOp::Open(f) | PendingOp::ImportFont(f) => f,
+        PendingOp::Open(f) | PendingOp::ImportFont(f) | PendingOp::ImportPngLayer(f) => f,
         PendingOp::Save { dialog, .. } => dialog,
     };
     let Some(result) = file.poll() else {
@@ -274,6 +282,20 @@ fn drain_pending(document: &mut Document, history: &mut History, state: &mut Men
                         document.bump_resources();
                     }
                     Err(e) => state.last_error = Some(format!("Font import failed: {e:#}")),
+                }
+            }
+        }
+        PendingOp::ImportPngLayer(_) => {
+            if let Some(path) = result {
+                match png_import::load_as_layer(&path, document.width, document.height) {
+                    Ok(layer) => {
+                        let index = document.layers.len();
+                        document.layers.push(layer.clone());
+                        document.active_layer = index;
+                        document.bump_resources();
+                        history.push(Command::AddLayer { index, layer });
+                    }
+                    Err(e) => state.last_error = Some(format!("PNG import failed: {e:#}")),
                 }
             }
         }
