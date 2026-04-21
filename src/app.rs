@@ -79,14 +79,14 @@ fn handle_global_shortcuts(
             if i.key_pressed(egui::Key::B) {
                 document.active_tool = ToolKind::Pencil;
             }
-            if i.key_pressed(egui::Key::E) {
-                document.active_tool = ToolKind::Eraser;
-            }
-            if i.key_pressed(egui::Key::I) {
-                document.active_tool = ToolKind::Eyedropper;
-            }
             if i.key_pressed(egui::Key::M) {
-                document.active_tool = ToolKind::RectSelect;
+                document.active_tool = ToolKind::Select;
+            }
+            if i.key_pressed(egui::Key::L) {
+                document.active_tool = ToolKind::Line;
+            }
+            if i.key_pressed(egui::Key::R) {
+                document.active_tool = ToolKind::Rectangle;
             }
             if i.key_pressed(egui::Key::X) {
                 std::mem::swap(&mut document.fg, &mut document.bg);

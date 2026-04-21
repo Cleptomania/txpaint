@@ -34,7 +34,7 @@ txpaint is a CP437 tile paint program. egui renders all panels (menu, tools, gly
 - `app.rs` implements `eframe::App::ui` (not `update` — that's deprecated in egui 0.34). It also extends the Proportional font family with `Hack` so geometric-shape glyphs (`▲`/`▼`, U+25B2/25BC) render in button labels — Ubuntu-Light/NotoEmoji/emoji-icon-font don't cover that block. `✕` (U+2715) is not in any bundled font; use `✖` (U+2716) for an X icon.
 - Panels use `egui::Panel::{top,bottom,left,right}` + `.show_inside(ui, ...)`. The older `TopBottomPanel`/`SidePanel` + `.show(ctx, ...)` API is deprecated.
 - `canvas_view.rs` handles pointer→cell hit-testing and tool dispatch. Pan = middle-drag; zoom = ctrl+scroll (fractional) or ctrl+shift+scroll (integer snap, threshold-accumulator'd so one real notch = one step). **egui consumes ctrl+scroll as a zoom gesture**: `i.smooth_scroll_delta` is zero in that case — use `i.zoom_delta()` instead. Home resets view.
-- Tools are dispatched through `tools::apply(document, history, x, y)` which calls `write_cell` to record before/after tiles into `History` during a stroke (bracketed by `history.begin_stroke()` / `end_stroke()` in `canvas_view.rs` on primary down/up).
+- The Pencil tool is dispatched per-cell through `tools::apply_pencil_cell(document, history, x, y)` which calls `write_cell` to record before/after tiles into `History` during a stroke (bracketed by `history.begin_stroke()` / `end_stroke()` in `canvas_view.rs` on primary down/up). Drag-gesture tools (Line, Rectangle, Select) track their own state in `CanvasViewState` and commit via `tools::commit_line` / `tools::commit_rectangle` / `apply_shape_select` on mouse-up.
 
 ### File I/O (`src/io/`)
 

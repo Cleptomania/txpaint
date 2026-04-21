@@ -1,6 +1,6 @@
 use crate::document::Document;
 use crate::history::History;
-use crate::tools::{self, ToolKind};
+use crate::tools::{self, PencilMode, RectMode, SelectMode, ToolKind};
 
 pub fn show(ui: &mut egui::Ui, document: &mut Document, history: &mut History) {
     ui.vertical(|ui| {
@@ -14,6 +14,39 @@ pub fn show(ui: &mut egui::Ui, document: &mut Document, history: &mut History) {
                 .on_hover_text(format!("{label} ({hotkey})"));
             if response.clicked() {
                 document.active_tool = tool;
+            }
+            if tool == ToolKind::Pencil && document.active_tool == ToolKind::Pencil {
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    for mode in PencilMode::ALL {
+                        let sel = document.pencil_mode == mode;
+                        if ui.selectable_label(sel, mode.label()).clicked() {
+                            document.pencil_mode = mode;
+                        }
+                    }
+                });
+            }
+            if tool == ToolKind::Select && document.active_tool == ToolKind::Select {
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    for mode in SelectMode::ALL {
+                        let sel = document.select_mode == mode;
+                        if ui.selectable_label(sel, mode.label()).clicked() {
+                            document.select_mode = mode;
+                        }
+                    }
+                });
+            }
+            if tool == ToolKind::Rectangle && document.active_tool == ToolKind::Rectangle {
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    for mode in RectMode::ALL {
+                        let sel = document.rect_mode == mode;
+                        if ui.selectable_label(sel, mode.label()).clicked() {
+                            document.rect_mode = mode;
+                        }
+                    }
+                });
             }
         }
         ui.separator();

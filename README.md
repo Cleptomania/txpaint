@@ -11,8 +11,6 @@ I'll accept PRs but I don't intend to publish builds of this anywhere at the mom
 ### Tools
 
 Pencil Tool - "paint" tiles by clicking
-Eraser Tool - erase tile by clicking
-Eyedropper - select highlighted color, kind of wonky right now
 
 Selection Tools
 

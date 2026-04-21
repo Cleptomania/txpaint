@@ -2,7 +2,7 @@ use crate::font::FontAtlas;
 use crate::glyph_palette::GlyphPalette;
 use crate::layer::Layer;
 use crate::palette::{Color, Palette};
-use crate::tools::ToolKind;
+use crate::tools::{PencilMode, RectMode, SelectMode, ToolKind};
 
 pub struct Document {
     pub width: u32,
@@ -26,6 +26,13 @@ pub struct Document {
     pub bundled_font_index: usize,
 
     pub active_tool: ToolKind,
+    /// Sub-mode for the Pencil tool (Simple / Dynamic).
+    pub pencil_mode: PencilMode,
+    /// Sub-mode for the Select tool (Cell / Rect / Oval). Preserved across
+    /// tool switches so returning to Select uses the last-chosen shape.
+    pub select_mode: SelectMode,
+    /// Sub-mode for the Rectangle tool (Outline / Fill).
+    pub rect_mode: RectMode,
 
     /// Current selection as a per-cell mask. Cleared to `None` when no cells
     /// are selected (so callers can use `is_some` for "active selection").
@@ -128,6 +135,24 @@ impl SelectionMask {
         }
     }
 
+    pub fn from_oval(w: u32, h: u32, bounds: CellRect) -> Option<Self> {
+        let mut m = Self::new(w, h);
+        m.add_oval(bounds);
+        if m.is_empty() { None } else { Some(m) }
+    }
+
+    pub fn add_oval(&mut self, bounds: CellRect) {
+        for (x, y) in oval_cells(bounds.clamped(self.w, self.h)) {
+            self.set(x, y, true);
+        }
+    }
+
+    pub fn subtract_oval(&mut self, bounds: CellRect) {
+        for (x, y) in oval_cells(bounds.clamped(self.w, self.h)) {
+            self.set(x, y, false);
+        }
+    }
+
     pub fn fill_all(&mut self) {
         for c in &mut self.cells {
             *c = true;
@@ -177,6 +202,9 @@ impl Document {
             font,
             bundled_font_index: 1,
             active_tool: ToolKind::Pencil,
+            pencil_mode: PencilMode::Simple,
+            select_mode: SelectMode::Rect,
+            rect_mode: RectMode::Outline,
             selection: None,
             resources_generation: 1,
         }
@@ -202,5 +230,33 @@ impl Document {
             layer.full_upload = true;
         }
     }
+}
+
+/// Iterate the cells of the ellipse inscribed in `bounds` (cell centers
+/// tested against the continuous ellipse equation). Assumes `bounds` is
+/// already clamped to a valid region — empty rects yield nothing.
+pub fn oval_cells(bounds: CellRect) -> impl Iterator<Item = (u32, u32)> {
+    let x0 = bounds.x;
+    let y0 = bounds.y;
+    let w = bounds.w;
+    let h = bounds.h;
+    let rx = w as f32 * 0.5;
+    let ry = h as f32 * 0.5;
+    let cx = x0 as f32 + rx;
+    let cy = y0 as f32 + ry;
+    // rx or ry can be zero only when bounds is empty; guard against div-by-0.
+    let rx2 = (rx * rx).max(f32::EPSILON);
+    let ry2 = (ry * ry).max(f32::EPSILON);
+    (0..h).flat_map(move |dy| {
+        (0..w).filter_map(move |dx| {
+            let px = (x0 + dx) as f32 + 0.5 - cx;
+            let py = (y0 + dy) as f32 + 0.5 - cy;
+            if (px * px) / rx2 + (py * py) / ry2 <= 1.0 {
+                Some((x0 + dx, y0 + dy))
+            } else {
+                None
+            }
+        })
+    })
 }
 
