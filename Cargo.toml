@@ -1,0 +1,19 @@
+[package]
+name = "txpaint"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+byteorder = "1.5.0"
+eframe = { version = "0.34.1", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+egui = "0.34.1"
+egui-wgpu = "0.34.1"
+flate2 = "1.1.9"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+rfd = "0.17.2"
+ron = "0.12.1"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+wgpu = "29.0.1"
