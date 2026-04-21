@@ -58,6 +58,30 @@ pub struct CanvasViewState {
     /// mouse, normal tool dispatch is suspended, and a primary click commits
     /// the paste (Shift = into a new layer).
     pub paste_preview: Option<PastePreview>,
+    /// When `Some`, an active Text-tool caret is on the canvas. Subsequent
+    /// text input writes glyphs at `(x, y)` and advances the caret; Enter
+    /// returns to `origin_x` on the next row. Cleared on Escape, tool switch,
+    /// or placing a new caret.
+    pub text_caret: Option<TextCaret>,
+}
+
+/// Ephemeral state for an in-progress Text-tool typing session.
+#[derive(Clone, Debug)]
+pub struct TextCaret {
+    /// Column Enter returns to — the X of the first click that started the
+    /// session. Preserved across Enter and Backspace so indented text keeps
+    /// its left edge.
+    pub origin_x: u32,
+    /// Current cursor position in canvas-cell coords. Writes land here,
+    /// then x advances by 1 (or wraps via Enter).
+    pub x: u32,
+    pub y: u32,
+    /// End-X of each finished line, in order (oldest first). An entry is
+    /// pushed whenever Enter actually advances to a new row, storing the
+    /// caret's x at the moment of the newline. Backspace at the left margin
+    /// pops the last entry and restores the caret to that (x, y-1) so the
+    /// user can rub out back across a newline into the previous line.
+    pub line_ends: Vec<u32>,
 }
 
 /// Ephemeral state for an in-progress paste placement. `origin` is the
@@ -118,6 +142,7 @@ impl Default for CanvasViewState {
             atlas_generation: 0,
             clipboard: None,
             paste_preview: None,
+            text_caret: None,
         }
     }
 }
@@ -499,6 +524,24 @@ pub fn show(
                 view.pencil_stroke_fresh.clear();
             }
         }
+        ToolKind::Text => {
+            // Primary click places (or moves) the caret, flushing any prior
+            // session into a single undo step. Accept drag-release too so a
+            // stray wiggle past egui's drag threshold still places the caret.
+            if response.clicked_by(PointerButton::Primary)
+                || response.drag_stopped_by(PointerButton::Primary)
+            {
+                if let Some((cx, cy)) = hover_cell {
+                    history.end_stroke();
+                    view.text_caret = Some(TextCaret {
+                        origin_x: cx,
+                        x: cx,
+                        y: cy,
+                        line_ends: Vec::new(),
+                    });
+                }
+            }
+        }
         ToolKind::Move => {
             // Drag the active layer around. `offset` is stored on Layer and
             // applied at render time; cells that scroll off-canvas stay in
@@ -552,6 +595,25 @@ pub fn show(
             }
         }
     }
+    }
+
+    // Switching away from the Text tool mid-session flushes the stroke so the
+    // typed run becomes one undo step and drops the caret. Covers tool-panel
+    // clicks, hotkey-driven switches, and loads that change the active tool.
+    if document.active_tool != ToolKind::Text && view.text_caret.is_some() {
+        history.end_stroke();
+        view.text_caret = None;
+    }
+
+    // Text-tool keyboard dispatch: runs only once a caret has been placed, so
+    // entering Text mode without clicking doesn't swallow global hotkeys.
+    // Also defers to any focused egui text field (layer rename, etc.) so
+    // typing into that field doesn't double-write to the canvas.
+    if document.active_tool == ToolKind::Text
+        && view.text_caret.is_some()
+        && !ui.ctx().wants_keyboard_input()
+    {
+        handle_text_input(ui, document, history, view);
     }
 
     // Visual backdrop.
@@ -787,6 +849,28 @@ pub fn show(
         }
     }
 
+    // Text caret: solid cyan outline at the typing cursor. Redrawn every
+    // frame (no blink) so it's always visible against any glyph backdrop.
+    if document.active_tool == ToolKind::Text {
+        if let Some(caret) = view.text_caret.as_ref() {
+            if caret.x < document.width && caret.y < document.height {
+                let min = unclipped.min
+                    + Vec2::new(
+                        caret.x as f32 * cell_pixel_w,
+                        caret.y as f32 * cell_pixel_h,
+                    );
+                let cell_rect =
+                    egui::Rect::from_min_size(min, Vec2::new(cell_pixel_w, cell_pixel_h));
+                ui.painter().rect_stroke(
+                    cell_rect.intersect(draw_rect),
+                    0.0,
+                    Stroke::new(2.0, Color32::from_rgb(80, 220, 255)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+    }
+
     // Reset-view hotkey: Home.
     if ui.input(|i| i.key_pressed(egui::Key::Home)) {
         view.pan = Vec2::ZERO;
@@ -980,6 +1064,168 @@ fn apply_pencil(
         view.pencil_stroke_fresh.insert((x, y));
     }
     tools::apply_pencil_cell(document, history, x, y, from, &view.pencil_stroke_fresh);
+}
+
+/// Consume keyboard events for the active Text-tool typing session. Text
+/// events become glyph writes (one cell per char, caret advances right);
+/// Enter returns the caret to `origin_x` on the next row; Backspace moves
+/// the caret back one cell (clamped to `origin_x`) and clears that cell;
+/// Escape ends the session and flushes the stroke as one undo step.
+fn handle_text_input(
+    ui: &egui::Ui,
+    document: &mut Document,
+    history: &mut History,
+    view: &mut CanvasViewState,
+) {
+    let (text_runs, enter, backspace, escape) = ui.input(|i| {
+        let mut runs: Vec<String> = Vec::new();
+        for event in &i.events {
+            if let egui::Event::Text(s) = event {
+                runs.push(s.clone());
+            }
+        }
+        (
+            runs,
+            i.key_pressed(egui::Key::Enter),
+            i.key_pressed(egui::Key::Backspace),
+            i.key_pressed(egui::Key::Escape),
+        )
+    });
+
+    if escape {
+        history.end_stroke();
+        view.text_caret = None;
+        return;
+    }
+
+    let cw = document.width;
+    let ch = document.height;
+
+    for run in text_runs {
+        for ch_c in run.chars() {
+            let Some(glyph) = char_to_cp437_glyph(ch_c) else {
+                continue;
+            };
+            let Some(caret) = view.text_caret.as_mut() else {
+                return;
+            };
+            if caret.x >= cw || caret.y >= ch {
+                continue;
+            }
+            let (wx, wy) = (caret.x, caret.y);
+            history.begin_stroke();
+            tools::write_text_glyph(document, history, wx, wy, glyph);
+            // Advance the caret one cell right. If it reaches the right edge
+            // it stays there — no auto-wrap, matching user expectation for a
+            // fixed-grid canvas. Re-fetch because write_text_glyph took &mut.
+            if let Some(caret) = view.text_caret.as_mut() {
+                if caret.x + 1 < cw {
+                    caret.x += 1;
+                }
+            }
+        }
+    }
+
+    if enter {
+        if let Some(caret) = view.text_caret.as_mut() {
+            if caret.y + 1 < ch {
+                // Remember where this line left off so backspace at the next
+                // line's left margin can wrap the caret back here.
+                caret.line_ends.push(caret.x);
+                caret.y += 1;
+                caret.x = caret.origin_x;
+            } else {
+                // Bottom edge: return to origin but don't advance (and don't
+                // record a line-end we can't actually wrap back from).
+                caret.x = caret.origin_x;
+            }
+        }
+    }
+
+    if backspace {
+        if let Some(caret) = view.text_caret.as_mut() {
+            if caret.x > caret.origin_x {
+                caret.x -= 1;
+                let (ex, ey) = (caret.x, caret.y);
+                history.begin_stroke();
+                tools::erase_text_cell(document, history, ex, ey);
+            } else if let Some(prev_end_x) = caret.line_ends.pop() {
+                // At the left margin with a prior line to wrap back into:
+                // jump to the end-of-text position of that line. No erase
+                // here — the cell was the caret's post-typing slot when
+                // Enter fired and stays empty. Subsequent backspaces on the
+                // reclaimed line use the normal erase branch above.
+                if caret.y > 0 {
+                    caret.y -= 1;
+                }
+                caret.x = prev_end_x;
+            }
+        }
+    }
+}
+
+/// Map a typed Unicode scalar to a CP437 glyph index, or None if the
+/// character has no CP437 equivalent (keyboards produce a few non-ASCII
+/// characters via dead keys / IME that we just drop). ASCII 0x20..=0x7E
+/// passes through literally; the extended 0x80..=0xFF range uses the
+/// standard CP437 code-page mapping.
+fn char_to_cp437_glyph(c: char) -> Option<u8> {
+    if (' '..='~').contains(&c) {
+        return Some(c as u8);
+    }
+    // Common extended CP437 entries reachable from typical keyboards.
+    match c {
+        '\u{00A0}' => Some(0xFF), // nbsp → blank cell glyph
+        '¢' => Some(0x9B),
+        '£' => Some(0x9C),
+        '¥' => Some(0x9D),
+        'ƒ' => Some(0x9F),
+        '¿' => Some(0xA8),
+        '°' => Some(0xF8),
+        '·' => Some(0xFA),
+        '±' => Some(0xF1),
+        '÷' => Some(0xF6),
+        '×' => Some(0x9E),
+        'ß' => Some(0xE1),
+        'ç' => Some(0x87),
+        'Ç' => Some(0x80),
+        'ñ' => Some(0xA4),
+        'Ñ' => Some(0xA5),
+        'á' => Some(0xA0),
+        'é' => Some(0x82),
+        'í' => Some(0xA1),
+        'ó' => Some(0xA2),
+        'ú' => Some(0xA3),
+        'Á' => Some(0xB5),
+        'É' => Some(0x90),
+        'Í' => Some(0xD6),
+        'Ó' => Some(0xE0),
+        'Ú' => Some(0xE9),
+        'à' => Some(0x85),
+        'è' => Some(0x8A),
+        'ì' => Some(0x8D),
+        'ò' => Some(0x95),
+        'ù' => Some(0x97),
+        'ä' => Some(0x84),
+        'ë' => Some(0x89),
+        'ï' => Some(0x8B),
+        'ö' => Some(0x94),
+        'ü' => Some(0x81),
+        'ÿ' => Some(0x98),
+        'Ä' => Some(0x8E),
+        'Ö' => Some(0x99),
+        'Ü' => Some(0x9A),
+        'â' => Some(0x83),
+        'ê' => Some(0x88),
+        'î' => Some(0x8C),
+        'ô' => Some(0x93),
+        'û' => Some(0x96),
+        'å' => Some(0x86),
+        'Å' => Some(0x8F),
+        'æ' => Some(0x91),
+        'Æ' => Some(0x92),
+        _ => None,
+    }
 }
 
 /// Upload (or reuse) an egui-side texture of the font atlas so shape

@@ -14,17 +14,10 @@ pub enum ToolKind {
     Line,
     Rectangle,
     Move,
+    Text,
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 5] = [
-        ToolKind::Pencil,
-        ToolKind::Select,
-        ToolKind::Line,
-        ToolKind::Rectangle,
-        ToolKind::Move,
-    ];
-
     pub fn label(self) -> &'static str {
         match self {
             ToolKind::Pencil => "Pencil",
@@ -32,6 +25,7 @@ impl ToolKind {
             ToolKind::Line => "Line",
             ToolKind::Rectangle => "Rectangle",
             ToolKind::Move => "Move",
+            ToolKind::Text => "Text",
         }
     }
 
@@ -44,6 +38,28 @@ impl ToolKind {
             ToolKind::Line => "L",
             ToolKind::Rectangle => "R",
             ToolKind::Move => "V",
+            ToolKind::Text => "T",
+        }
+    }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            ToolKind::Pencil => "Paint one cell at a time. Drag to stroke.",
+            ToolKind::Select => {
+                "Mark a region of cells to fill, erase, copy, or paste. \
+                 Hold Shift to add to the current selection; Ctrl to subtract."
+            }
+            ToolKind::Line => "Drag to stroke a straight line of the selected glyph.",
+            ToolKind::Rectangle => "Drag to stroke a rectangle of the selected glyph.",
+            ToolKind::Move => {
+                "Drag the active layer to reposition it. Cells that scroll \
+                 off-canvas stay in the layer buffer and return when dragged back."
+            }
+            ToolKind::Text => {
+                "Click a cell to place a caret, then type to write text. \
+                 Enter starts a new line at the caret's origin x; \
+                 Backspace erases; Escape exits text entry."
+            }
         }
     }
 }
@@ -69,6 +85,17 @@ impl PencilMode {
             PencilMode::Dynamic => "Dynamic",
         }
     }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            PencilMode::Simple => "Stamps the selected glyph on every painted cell.",
+            PencilMode::Dynamic => {
+                "Box-drawing glyphs auto-connect to adjacent box-drawing cells, \
+                 picking corners and T-junctions to match neighbors. \
+                 Non-box glyphs behave like Simple."
+            }
+        }
+    }
 }
 
 /// Sub-mode for the Rectangle tool.
@@ -90,6 +117,16 @@ impl RectMode {
         match self {
             RectMode::Outline => "Outline",
             RectMode::Fill => "Fill",
+        }
+    }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            RectMode::Outline => {
+                "Draw only the perimeter. Box-drawing glyphs pick matching \
+                 corners and edges from the shape's family."
+            }
+            RectMode::Fill => "Fill every cell inside the rectangle with the selected glyph.",
         }
     }
 }
@@ -115,6 +152,20 @@ impl SelectMode {
             SelectMode::Cell => "Cell",
             SelectMode::Rect => "Rect",
             SelectMode::Oval => "Oval",
+        }
+    }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            SelectMode::Cell => {
+                "Paint cells freehand — each cell touched toggles in or out \
+                 of the selection live."
+            }
+            SelectMode::Rect => "Drag a bounding rectangle; release to commit the selection.",
+            SelectMode::Oval => {
+                "Drag a bounding rectangle; the inscribed ellipse becomes \
+                 the selection."
+            }
         }
     }
 }
@@ -534,6 +585,56 @@ fn slot_glyph(f: &shape_families::RectFamily, rect: CellRect, x: u32, y: u32) ->
         (_, cy) if cy == y0 || cy == y1 => f.h,
         _ => f.v,
     }
+}
+
+/// Write a single cell on the active layer with `glyph` and the active
+/// fg/bg. Used by the Text tool — the typed character determines the glyph,
+/// not `document.selected_glyph`. Coordinates are canvas-space; the active
+/// layer's offset is applied. Out-of-buffer coords no-op. Caller brackets
+/// with `begin_stroke` / `end_stroke`.
+pub fn write_text_glyph(
+    document: &mut Document,
+    history: &mut History,
+    x: u32,
+    y: u32,
+    glyph: u8,
+) {
+    let tile = Tile {
+        glyph,
+        fg: document.fg,
+        bg: document.bg,
+    };
+    write_text_tile(document, history, x, y, tile);
+}
+
+/// Clear a single cell on the active layer to glyph 0 + transparent bg —
+/// used by the Text tool's Backspace. Caller brackets with begin/end stroke.
+pub fn erase_text_cell(document: &mut Document, history: &mut History, x: u32, y: u32) {
+    let tile = Tile {
+        glyph: 0,
+        fg: document.fg,
+        bg: TRANSPARENT_BG,
+    };
+    write_text_tile(document, history, x, y, tile);
+}
+
+fn write_text_tile(
+    document: &mut Document,
+    history: &mut History,
+    x: u32,
+    y: u32,
+    tile: Tile,
+) {
+    let w = document.width;
+    let h = document.height;
+    let layer_index = document.active_layer;
+    let (dx, dy) = document.layers[layer_index].offset;
+    let lx = x as i32 - dx;
+    let ly = y as i32 - dy;
+    if lx < 0 || ly < 0 || lx >= w as i32 || ly >= h as i32 {
+        return;
+    }
+    write_cell(document, history, layer_index, w, lx as u32, ly as u32, tile);
 }
 
 /// Commit a line stroke between two canvas cells using the active

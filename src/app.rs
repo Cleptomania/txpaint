@@ -66,6 +66,10 @@ fn handle_global_shortcuts(
     // Skip single-letter tool hotkeys when a text field has focus (e.g. layer
     // rename), so typing an "e" into a name field doesn't switch to the eraser.
     let text_has_focus = ctx.wants_keyboard_input();
+    // While the Text tool has an active caret, letter keys produce glyphs on
+    // the canvas; don't also fire tool-switch hotkeys or glyph-nav.
+    let in_text_session = document.active_tool == ToolKind::Text
+        && ui_state.canvas_view.text_caret.is_some();
     ctx.input(|i| {
         let ctrl = i.modifiers.ctrl || i.modifiers.command;
         if ctrl && i.key_pressed(egui::Key::Z) && !i.modifiers.shift {
@@ -77,17 +81,23 @@ fn handle_global_shortcuts(
         if ctrl && i.key_pressed(egui::Key::Z) && i.modifiers.shift {
             history.redo(document);
         }
-        // egui converts Ctrl+C / Ctrl+V into Copy / Paste events (so they
-        // round-trip through the OS clipboard for text), rather than firing
-        // `key_pressed(Key::C/V)`. Hook the events to run our selection
-        // copy / paste-mode entry. Skipped when a text field owns focus so
-        // real text paste still works.
+        // egui converts Ctrl+C / Ctrl+X / Ctrl+V into Copy / Cut / Paste
+        // events (so they round-trip through the OS clipboard for text),
+        // rather than firing `key_pressed(Key::C/X/V)`. Hook the events to
+        // run our selection copy / cut / paste-mode entry. Skipped when a
+        // text field owns focus so real text cut/paste still works.
         if !text_has_focus {
             for event in &i.events {
                 match event {
                     egui::Event::Copy => {
                         if let Some(clip) = tools::copy_selection(document) {
                             ui_state.canvas_view.clipboard = Some(clip);
+                        }
+                    }
+                    egui::Event::Cut => {
+                        if let Some(clip) = tools::copy_selection(document) {
+                            ui_state.canvas_view.clipboard = Some(clip);
+                            tools::erase_selection(document, history);
                         }
                     }
                     egui::Event::Paste(_) => {
@@ -103,12 +113,13 @@ fn handle_global_shortcuts(
                 }
             }
         }
-        if !ctrl && !i.modifiers.alt && !text_has_focus {
+        if !ctrl && !i.modifiers.alt && !text_has_focus && !in_text_session {
             let tool_key = i.key_pressed(egui::Key::B)
                 || i.key_pressed(egui::Key::M)
                 || i.key_pressed(egui::Key::L)
                 || i.key_pressed(egui::Key::R)
-                || i.key_pressed(egui::Key::V);
+                || i.key_pressed(egui::Key::V)
+                || i.key_pressed(egui::Key::T);
             if tool_key {
                 ui_state.canvas_view.paste_preview = None;
             }
@@ -127,13 +138,16 @@ fn handle_global_shortcuts(
             if i.key_pressed(egui::Key::V) {
                 document.active_tool = ToolKind::Move;
             }
+            if i.key_pressed(egui::Key::T) {
+                document.active_tool = ToolKind::Text;
+            }
             if i.key_pressed(egui::Key::X) {
                 std::mem::swap(&mut document.fg, &mut document.bg);
             }
         }
     });
 
-    if text_has_focus {
+    if text_has_focus || in_text_session {
         return;
     }
     let ctx_input = ctx.input(|i| {
