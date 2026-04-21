@@ -265,6 +265,27 @@ pub fn stroke_family(glyph: u8) -> LineStyle {
     }
 }
 
+/// Horizontally/vertically flip a glyph. Box-drawing glyphs route through
+/// the connection pattern (swap left↔right for `flip_h`, top↔bottom for
+/// `flip_v`) so corners, T-junctions, and mixed-family glyphs pick up the
+/// correct flipped variant. Non-box glyphs pass through unchanged —
+/// character glyphs don't have a sensible flipped form.
+pub fn flip_glyph(glyph: u8, flip_h: bool, flip_v: bool) -> u8 {
+    if !flip_h && !flip_v {
+        return glyph;
+    }
+    let Some(mut pattern) = glyph_to_pattern(glyph) else {
+        return glyph;
+    };
+    if flip_h {
+        std::mem::swap(&mut pattern.left, &mut pattern.right);
+    }
+    if flip_v {
+        std::mem::swap(&mut pattern.top, &mut pattern.bottom);
+    }
+    pattern_to_glyph(pattern).unwrap_or(glyph)
+}
+
 /// If `pattern` has mismatched opposite slots (e.g. top=S, bottom=D) force
 /// the mismatched axis to `family`, which generally gets us back to a
 /// lookup-table entry. No-op for `family == None`.

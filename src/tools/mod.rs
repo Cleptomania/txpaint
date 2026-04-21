@@ -47,7 +47,11 @@ impl ToolKind {
             ToolKind::Pencil => "Paint one cell at a time. Drag to stroke.",
             ToolKind::Select => {
                 "Mark a region of cells to fill, erase, copy, or paste. \
-                 Hold Shift to add to the current selection; Ctrl to subtract."
+                 Hold Shift to add to the current selection; Ctrl to subtract. \
+                 While placing a paste (Ctrl+V), press H to flip the paste \
+                 horizontally or J to flip it vertically — box-drawing glyphs \
+                 swap to their mirror variant so corners and T-junctions stay \
+                 connected."
             }
             ToolKind::Line => "Drag to stroke a straight line of the selected glyph.",
             ToolKind::Rectangle => "Drag to stroke a rectangle of the selected glyph.",
@@ -186,32 +190,48 @@ pub fn apply_pencil_cell(
     if x >= document.width || y >= document.height {
         return;
     }
+    // All three channel toggles off → nothing to write. Skip dynamic-mode
+    // neighbor refresh too, since the center cell wouldn't have changed.
+    if !document.pencil_write_glyph
+        && !document.pencil_write_fg
+        && !document.pencil_write_bg
+    {
+        return;
+    }
     let w = document.width;
     let layer_index = document.active_layer;
     match document.pencil_mode {
         PencilMode::Simple => {
-            let new_tile = Tile {
-                glyph: document.selected_glyph,
-                fg: document.fg,
-                bg: document.bg,
-            };
+            let existing = document.layers[layer_index].get(w, x, y);
+            let new_tile = pencil_tile(document, existing, document.selected_glyph);
             write_cell(document, history, layer_index, w, x, y, new_tile);
         }
         PencilMode::Dynamic => {
             let selected = document.selected_glyph;
-            if shape_families::is_connected_glyph(selected) {
+            // Dynamic glyph derivation only makes sense when we're actually
+            // writing the glyph channel — otherwise the cell's glyph stays
+            // put, so neighbors have nothing new to connect to.
+            if document.pencil_write_glyph && shape_families::is_connected_glyph(selected) {
                 write_dynamic_cell(document, history, x, y, from, fresh_cells);
             } else {
-                // Non-box-drawing glyph — dynamic mode degrades to a literal
-                // write so the user still gets their selected glyph placed.
-                let new_tile = Tile {
-                    glyph: selected,
-                    fg: document.fg,
-                    bg: document.bg,
-                };
+                // Non-box glyph or glyph channel disabled: degrade to a
+                // per-channel-gated literal write of the center cell.
+                let existing = document.layers[layer_index].get(w, x, y);
+                let new_tile = pencil_tile(document, existing, selected);
                 write_cell(document, history, layer_index, w, x, y, new_tile);
             }
         }
+    }
+}
+
+/// Build the tile the pencil should write, honoring the per-channel toggles
+/// on `document`. For each channel whose toggle is off, the existing cell's
+/// value is preserved.
+fn pencil_tile(document: &Document, existing: Tile, glyph: u8) -> Tile {
+    Tile {
+        glyph: if document.pencil_write_glyph { glyph } else { existing.glyph },
+        fg: if document.pencil_write_fg { document.fg } else { existing.fg },
+        bg: if document.pencil_write_bg { document.bg } else { existing.bg },
     }
 }
 
@@ -272,11 +292,8 @@ fn write_dynamic_cell(
         .or_else(|| shape_families::pattern_to_glyph(shape_families::coerce_to_family(pattern, stroke_fam)))
         .unwrap_or(selected);
 
-    let new_tile = Tile {
-        glyph,
-        fg: document.fg,
-        bg: document.bg,
-    };
+    let existing = document.layers[layer_index].get(w, x, y);
+    let new_tile = pencil_tile(document, existing, glyph);
     write_cell(document, history, layer_index, w, x, y, new_tile);
 
     // For neighbor refresh we advertise the written glyph's canonical
@@ -712,6 +729,33 @@ pub struct Clipboard {
     pub cells: Vec<ClipCell>,
 }
 
+impl Clipboard {
+    /// Iterate the clipboard's cells with an optional horizontal/vertical
+    /// flip applied. Positions are mirrored within the clipboard bbox, and
+    /// box-drawing glyphs get swapped for their flipped variant so lines,
+    /// corners, and T-junctions keep their connectivity. Used by both the
+    /// paste preview and the commit path so they agree.
+    pub fn iter_flipped(
+        &self,
+        flip_h: bool,
+        flip_v: bool,
+    ) -> impl Iterator<Item = (u32, u32, Tile)> + '_ {
+        let w = self.w;
+        let h = self.h;
+        self.cells.iter().map(move |cc| {
+            let dx = if flip_h && w > 0 { w - 1 - cc.dx } else { cc.dx };
+            let dy = if flip_v && h > 0 { h - 1 - cc.dy } else { cc.dy };
+            let glyph = shape_families::flip_glyph(cc.tile.glyph, flip_h, flip_v);
+            let tile = Tile {
+                glyph,
+                fg: cc.tile.fg,
+                bg: cc.tile.bg,
+            };
+            (dx, dy, tile)
+        })
+    }
+}
+
 /// Capture the cells under `document.selection` on the active layer into a
 /// new `Clipboard`. Returns `None` if there is no active selection.
 pub fn copy_selection(document: &Document) -> Option<Clipboard> {
@@ -761,6 +805,8 @@ pub fn commit_paste(
     origin_x: u32,
     origin_y: u32,
     new_layer: bool,
+    flip_h: bool,
+    flip_v: bool,
 ) {
     if clipboard.cells.is_empty() {
         return;
@@ -772,13 +818,13 @@ pub fn commit_paste(
         // directly in the buffer.
         let name = format!("Layer {}", document.layers.len() + 1);
         let mut layer = Layer::new(name, cw, ch);
-        for cc in &clipboard.cells {
-            let x = origin_x.saturating_add(cc.dx);
-            let y = origin_y.saturating_add(cc.dy);
+        for (cdx, cdy, tile) in clipboard.iter_flipped(flip_h, flip_v) {
+            let x = origin_x.saturating_add(cdx);
+            let y = origin_y.saturating_add(cdy);
             if x >= cw || y >= ch {
                 continue;
             }
-            layer.set(cw, x, y, cc.tile);
+            layer.set(cw, x, y, tile);
         }
         let index = document.layers.len();
         document.layers.push(layer.clone());
@@ -789,15 +835,15 @@ pub fn commit_paste(
         let layer_index = document.active_layer;
         let (dx, dy) = document.layers[layer_index].offset;
         history.begin_stroke();
-        for cc in &clipboard.cells {
-            let cx = origin_x as i32 + cc.dx as i32;
-            let cy = origin_y as i32 + cc.dy as i32;
+        for (cdx, cdy, tile) in clipboard.iter_flipped(flip_h, flip_v) {
+            let cx = origin_x as i32 + cdx as i32;
+            let cy = origin_y as i32 + cdy as i32;
             let lx = cx - dx;
             let ly = cy - dy;
             if lx < 0 || ly < 0 || lx >= cw as i32 || ly >= ch as i32 {
                 continue;
             }
-            write_cell(document, history, layer_index, cw, lx as u32, ly as u32, cc.tile);
+            write_cell(document, history, layer_index, cw, lx as u32, ly as u32, tile);
         }
         history.end_stroke();
     }

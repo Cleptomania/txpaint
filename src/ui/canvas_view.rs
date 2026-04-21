@@ -87,9 +87,14 @@ pub struct TextCaret {
 /// Ephemeral state for an in-progress paste placement. `origin` is the
 /// canvas-space cell where the clipboard's top-left should land; it tracks
 /// hover_cell each frame. `None` when the cursor isn't over the canvas yet.
-#[derive(Copy, Clone, Debug)]
+/// `flip_h`/`flip_v` mirror the paste within its bounding box — the preview
+/// and commit both apply the same transform, including a box-drawing glyph
+/// substitution so corners/T-junctions keep their connectivity.
+#[derive(Copy, Clone, Debug, Default)]
 pub struct PastePreview {
     pub origin: Option<(u32, u32)>,
+    pub flip_h: bool,
+    pub flip_v: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -250,15 +255,41 @@ pub fn show(
                 preview.origin = Some(cell);
             }
         }
+        // Flip shortcuts — H = horizontal, J = vertical. Only fire when no
+        // modifier is held (so they don't collide with Ctrl/Alt combos) and
+        // no text field owns focus (so a rename field can still type "h").
+        let (flip_h_key, flip_v_key) = ui.input(|i| {
+            let bare = !i.modifiers.ctrl
+                && !i.modifiers.command
+                && !i.modifiers.alt
+                && !i.modifiers.shift;
+            (
+                bare && i.key_pressed(egui::Key::H),
+                bare && i.key_pressed(egui::Key::J),
+            )
+        });
+        if !ui.ctx().wants_keyboard_input() {
+            if let Some(preview) = view.paste_preview.as_mut() {
+                if flip_h_key {
+                    preview.flip_h = !preview.flip_h;
+                }
+                if flip_v_key {
+                    preview.flip_v = !preview.flip_v;
+                }
+            }
+        }
         // Accept either a clean click or a drag-release so the paste commits
         // even if the user wiggled the cursor past egui's drag threshold.
         if response.clicked_by(PointerButton::Primary)
             || response.drag_stopped_by(PointerButton::Primary)
         {
             let shift = ui.input(|i| i.modifiers.shift);
-            let origin = view.paste_preview.and_then(|p| p.origin);
+            let preview = view.paste_preview;
+            let origin = preview.and_then(|p| p.origin);
+            let flip_h = preview.map(|p| p.flip_h).unwrap_or(false);
+            let flip_v = preview.map(|p| p.flip_v).unwrap_or(false);
             if let (Some(clip), Some((ox, oy))) = (view.clipboard.as_ref(), origin) {
-                tools::commit_paste(document, history, clip, ox, oy, shift);
+                tools::commit_paste(document, history, clip, ox, oy, shift, flip_h, flip_v);
             }
             view.paste_preview = None;
         }
@@ -782,9 +813,9 @@ pub fn show(
             );
             let tex_id = texture.id();
             let painter = ui.painter_at(draw_rect);
-            for cc in &clip.cells {
-                let cx = ox.saturating_add(cc.dx);
-                let cy = oy.saturating_add(cc.dy);
+            for (cdx, cdy, tile) in clip.iter_flipped(preview.flip_h, preview.flip_v) {
+                let cx = ox.saturating_add(cdx);
+                let cy = oy.saturating_add(cdy);
                 if cx >= document.width || cy >= document.height {
                     continue;
                 }
@@ -792,17 +823,17 @@ pub fn show(
                     + Vec2::new(cx as f32 * cell_pixel_w, cy as f32 * cell_pixel_h);
                 let cell_rect =
                     egui::Rect::from_min_size(min, Vec2::new(cell_pixel_w, cell_pixel_h));
-                let bg = cc.tile.bg;
+                let bg = tile.bg;
                 let backdrop = if bg == crate::tile::TRANSPARENT_BG {
                     Color32::from_rgba_unmultiplied(0, 0, 0, 100)
                 } else {
                     Color32::from_rgba_unmultiplied(bg.0[0], bg.0[1], bg.0[2], 160)
                 };
                 painter.rect_filled(cell_rect, 0.0, backdrop);
-                let fg = cc.tile.fg;
+                let fg = tile.fg;
                 let glyph_tint =
                     Color32::from_rgba_unmultiplied(fg.0[0], fg.0[1], fg.0[2], 200);
-                let glyph = cc.tile.glyph;
+                let glyph = tile.glyph;
                 let gx = (glyph % 16) as f32;
                 let gy = (glyph / 16) as f32;
                 let uv = egui::Rect::from_min_max(

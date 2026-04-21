@@ -55,7 +55,7 @@ pub fn layout(
     });
 
     egui::Panel::left("tools").default_size(180.0).show_inside(ui, |ui| {
-        tools_panel::show(ui, document, history);
+        tools_panel::show(ui, document, history, &mut state.canvas_view);
     });
 
     egui::Panel::right("layers").default_size(260.0).show_inside(ui, |ui| {

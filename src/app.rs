@@ -106,7 +106,7 @@ fn handle_global_shortcuts(
                             ui_state.canvas_view.line_drag = None;
                             ui_state.canvas_view.rect_drag = None;
                             ui_state.canvas_view.paste_preview =
-                                Some(PastePreview { origin: None });
+                                Some(PastePreview::default());
                         }
                     }
                     _ => {}

@@ -28,6 +28,12 @@ pub struct Document {
     pub active_tool: ToolKind,
     /// Sub-mode for the Pencil tool (Simple / Dynamic).
     pub pencil_mode: PencilMode,
+    /// Channel toggles for the Pencil tool, orthogonal to `pencil_mode`. Each
+    /// toggle gates whether writing a cell replaces that channel; if off, the
+    /// cell's existing value is preserved. All three off is a no-op stroke.
+    pub pencil_write_glyph: bool,
+    pub pencil_write_fg: bool,
+    pub pencil_write_bg: bool,
     /// Sub-mode for the Select tool (Cell / Rect / Oval). Preserved across
     /// tool switches so returning to Select uses the last-chosen shape.
     pub select_mode: SelectMode,
@@ -203,6 +209,9 @@ impl Document {
             bundled_font_index: 1,
             active_tool: ToolKind::Pencil,
             pencil_mode: PencilMode::Simple,
+            pencil_write_glyph: true,
+            pencil_write_fg: true,
+            pencil_write_bg: true,
             select_mode: SelectMode::Rect,
             rect_mode: RectMode::Outline,
             selection: None,

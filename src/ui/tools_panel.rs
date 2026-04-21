@@ -1,8 +1,14 @@
 use crate::document::Document;
 use crate::history::History;
 use crate::tools::{self, PencilMode, RectMode, SelectMode, ToolKind};
+use crate::ui::canvas_view::CanvasViewState;
 
-pub fn show(ui: &mut egui::Ui, document: &mut Document, history: &mut History) {
+pub fn show(
+    ui: &mut egui::Ui,
+    document: &mut Document,
+    history: &mut History,
+    view: &mut CanvasViewState,
+) {
     ui.vertical(|ui| {
         const CATEGORIES: &[(&str, &[ToolKind])] = &[
             (
@@ -22,6 +28,35 @@ pub fn show(ui: &mut egui::Ui, document: &mut Document, history: &mut History) {
             for &tool in *tools {
                 tool_row(ui, document, history, tool);
             }
+        }
+        if let Some(preview) = view.paste_preview.as_mut() {
+            ui.separator();
+            ui.heading("Paste");
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                if ui
+                    .selectable_label(preview.flip_h, "Flip H")
+                    .on_hover_text(
+                        "Mirror the paste left↔right. Box-drawing glyphs swap \
+                         to their flipped variant so corners and T-junctions \
+                         stay connected. (H)",
+                    )
+                    .clicked()
+                {
+                    preview.flip_h = !preview.flip_h;
+                }
+                if ui
+                    .selectable_label(preview.flip_v, "Flip V")
+                    .on_hover_text(
+                        "Mirror the paste top↔bottom. Box-drawing glyphs swap \
+                         to their flipped variant so corners and T-junctions \
+                         stay connected. (J)",
+                    )
+                    .clicked()
+                {
+                    preview.flip_v = !preview.flip_v;
+                }
+            });
         }
         ui.separator();
         ui.heading("Colors");
@@ -71,6 +106,27 @@ fn tool_row(ui: &mut egui::Ui, document: &mut Document, history: &mut History, t
                     }
                 }
             });
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                pencil_channel_toggle(
+                    ui,
+                    &mut document.pencil_write_glyph,
+                    "Glyph",
+                    "When on, the pencil writes the selected glyph. When off, each cell's existing glyph is preserved (useful for recoloring without changing shapes).",
+                );
+                pencil_channel_toggle(
+                    ui,
+                    &mut document.pencil_write_fg,
+                    "Fg",
+                    "When on, the pencil writes the foreground color. When off, each cell's existing foreground is preserved.",
+                );
+                pencil_channel_toggle(
+                    ui,
+                    &mut document.pencil_write_bg,
+                    "Bg",
+                    "When on, the pencil writes the background color. When off, each cell's existing background is preserved.",
+                );
+            });
         }
         ToolKind::Select => {
             ui.horizontal(|ui| {
@@ -117,6 +173,16 @@ fn tool_row(ui: &mut egui::Ui, document: &mut Document, history: &mut History, t
             });
         }
         _ => {}
+    }
+}
+
+fn pencil_channel_toggle(ui: &mut egui::Ui, value: &mut bool, label: &str, tooltip: &str) {
+    if ui
+        .selectable_label(*value, label)
+        .on_hover_text(tooltip)
+        .clicked()
+    {
+        *value = !*value;
     }
 }
 
