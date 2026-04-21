@@ -51,6 +51,12 @@ pub fn layout(
                 "Glyph: {} (0x{:02X})",
                 document.selected_glyph, document.selected_glyph
             ));
+            ui.separator();
+            let hover = match state.canvas_view.hover_cell {
+                Some((x, y)) => format!("X,Y: {}, {}", x, y),
+                None => "X,Y: -, -".to_string(),
+            };
+            ui.label(hover);
         });
     });
 

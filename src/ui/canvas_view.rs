@@ -72,6 +72,11 @@ pub struct CanvasViewState {
     /// returns to `origin_x` on the next row. Cleared on Escape, tool switch,
     /// or placing a new caret.
     pub text_caret: Option<TextCaret>,
+    /// Last canvas-space cell under the cursor. `None` when the pointer is
+    /// outside the canvas. Read by the status bar; the status panel renders
+    /// before the canvas panel so readings are one frame behind, which is
+    /// imperceptible since pointer motion triggers continuous repaints.
+    pub hover_cell: Option<(u32, u32)>,
 }
 
 /// Ephemeral state for an in-progress Text-tool typing session.
@@ -174,6 +179,7 @@ impl Default for CanvasViewState {
             clipboard: None,
             paste_preview: None,
             text_caret: None,
+            hover_cell: None,
         }
     }
 }
@@ -271,6 +277,7 @@ pub fn show(
         }
         Some((cx as u32, cy as u32))
     });
+    view.hover_cell = hover_cell;
 
     // Signed hover cell for tools that need to pick positions past the
     // current canvas edges (Resize). Hit-tests against the full viewport
