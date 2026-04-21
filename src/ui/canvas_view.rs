@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use egui::{Color32, PointerButton, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
 
 use crate::document::{CellRect, Document, SelectionMask};
@@ -35,6 +37,12 @@ pub struct CanvasViewState {
     /// Bresenham-interpolate between pointer frames so fast drags don't skip
     /// cells (important for Dynamic mode's connectivity).
     pub pencil_last: Option<(u32, u32)>,
+    /// Cells created (not already box-family) by the current Dynamic-pencil
+    /// stroke. These are re-derived entirely from their actual neighbors
+    /// during refresh (dropping canonical stub arms) so a stroke that turns
+    /// yields a true corner instead of a T-junction with stub arms. Cells
+    /// NOT in this set were pre-existing and keep their canonical.
+    pub pencil_stroke_fresh: HashSet<(u32, u32)>,
     /// Cached egui-side copy of the active font atlas, used to draw ghosted
     /// glyph previews (Rectangle-tool drag preview, etc.). Rebuilt when the
     /// document's `resources_generation` changes (font swap, etc.).
@@ -73,6 +81,7 @@ impl Default for CanvasViewState {
             line_drag: None,
             rect_drag: None,
             pencil_last: None,
+            pencil_stroke_fresh: HashSet::new(),
             atlas_texture: None,
             atlas_generation: 0,
         }
@@ -370,6 +379,7 @@ pub fn show(
             {
                 history.begin_stroke();
                 view.pencil_last = None;
+                view.pencil_stroke_fresh.clear();
             }
             if (response.dragged_by(PointerButton::Primary) && primary_down)
                 || response.clicked_by(PointerButton::Primary)
@@ -380,10 +390,12 @@ pub fn show(
                     // cell adjacency) and nice-to-have for Simple.
                     match view.pencil_last {
                         None => {
-                            tools::apply_pencil_cell(document, history, x, y);
+                            apply_pencil(document, history, view, x, y, None);
+                            view.pencil_last = Some((x, y));
                         }
                         Some((px, py)) if (px, py) == (x, y) => {}
                         Some((px, py)) => {
+                            let mut prev = (px, py);
                             for (cx, cy) in
                                 tools::bresenham_cells(px as i32, py as i32, x as i32, y as i32)
                             {
@@ -399,16 +411,13 @@ pub fn show(
                                 if (cx as u32, cy as u32) == (px, py) {
                                     continue;
                                 }
-                                tools::apply_pencil_cell(
-                                    document,
-                                    history,
-                                    cx as u32,
-                                    cy as u32,
-                                );
+                                let cell = (cx as u32, cy as u32);
+                                apply_pencil(document, history, view, cell.0, cell.1, Some(prev));
+                                prev = cell;
                             }
+                            view.pencil_last = Some(prev);
                         }
                     }
-                    view.pencil_last = Some((x, y));
                 }
             }
             if response.drag_stopped_by(PointerButton::Primary)
@@ -416,6 +425,7 @@ pub fn show(
             {
                 history.end_stroke();
                 view.pencil_last = None;
+                view.pencil_stroke_fresh.clear();
             }
         }
     }
@@ -745,6 +755,31 @@ fn draw_mask(
             }
         }
     }
+}
+
+/// Route a single pencil cell through `tools::apply_pencil_cell`, first
+/// tagging the cell as "fresh" if it didn't already hold a box-drawing
+/// glyph. The fresh set is used by Dynamic mode's refresh step to drop
+/// canonical stub arms on cells the stroke itself placed, so turning
+/// strokes form true corners instead of T-junctions with dangling arms.
+fn apply_pencil(
+    document: &mut Document,
+    history: &mut History,
+    view: &mut CanvasViewState,
+    x: u32,
+    y: u32,
+    from: Option<(u32, u32)>,
+) {
+    if x >= document.width || y >= document.height {
+        return;
+    }
+    let existing_glyph = document.layers[document.active_layer]
+        .get(document.width, x, y)
+        .glyph;
+    if !tools::shape_families::is_connected_glyph(existing_glyph) {
+        view.pencil_stroke_fresh.insert((x, y));
+    }
+    tools::apply_pencil_cell(document, history, x, y, from, &view.pencil_stroke_fresh);
 }
 
 /// Upload (or reuse) an egui-side texture of the font atlas so shape

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::document::{CellRect, Document};
 use crate::history::{CellChange, History};
 use crate::tile::{TRANSPARENT_BG, Tile};
@@ -117,7 +119,14 @@ impl SelectMode {
 /// Connected family, this cell's glyph and each of its family-neighbor
 /// cells' glyphs are re-evaluated so lines/corners/T-junctions auto-connect.
 /// Caller brackets the stroke with `begin_stroke` / `end_stroke`.
-pub fn apply_pencil_cell(document: &mut Document, history: &mut History, x: u32, y: u32) {
+pub fn apply_pencil_cell(
+    document: &mut Document,
+    history: &mut History,
+    x: u32,
+    y: u32,
+    from: Option<(u32, u32)>,
+    fresh_cells: &HashSet<(u32, u32)>,
+) {
     if x >= document.width || y >= document.height {
         return;
     }
@@ -134,122 +143,185 @@ pub fn apply_pencil_cell(document: &mut Document, history: &mut History, x: u32,
         }
         PencilMode::Dynamic => {
             let selected = document.selected_glyph;
-            let Some(family) = shape_families::connected_family_for(selected) else {
-                // Selected glyph isn't part of any Connected family — fall
-                // through to simple behavior so dynamic mode is a no-op for
-                // non-box glyphs.
+            if shape_families::is_connected_glyph(selected) {
+                write_dynamic_cell(document, history, x, y, from, fresh_cells);
+            } else {
+                // Non-box-drawing glyph — dynamic mode degrades to a literal
+                // write so the user still gets their selected glyph placed.
                 let new_tile = Tile {
                     glyph: selected,
                     fg: document.fg,
                     bg: document.bg,
                 };
                 write_cell(document, history, layer_index, w, x, y, new_tile);
-                return;
-            };
-            write_dynamic_cell(document, history, x, y, family);
+            }
         }
     }
 }
 
-/// Core of the Dynamic pencil: place (or refresh) the cell at `(x, y)` as a
-/// member of `family`, then re-evaluate each of its four neighbors that are
-/// already family members — their connection masks gained a new bit.
+/// Core of the Dynamic pencil. Derives `(x, y)`'s connection pattern from
+/// its four neighbors' glyphs, picks the matching CP437 box-drawing glyph,
+/// and then re-evaluates each neighbor's glyph by flipping only the slot
+/// that faces the just-written cell (preserving the neighbor's other slots
+/// so an unrelated existing line segment isn't rewritten).
 fn write_dynamic_cell(
     document: &mut Document,
     history: &mut History,
     x: u32,
     y: u32,
-    family: &shape_families::ConnectedFamily,
+    from: Option<(u32, u32)>,
+    fresh_cells: &HashSet<(u32, u32)>,
 ) {
+    use shape_families::{ConnectionPattern, LineStyle, Side};
+
     let w = document.width;
     let layer_index = document.active_layer;
-    // Write `(x, y)` first so the neighbor refresh sees it as family.
-    refresh_family_cell(document, history, layer_index, w, x, y, family, true);
-    // Neighbors: up, right, down, left.
-    let neighbors: [(i32, i32); 4] = [
-        (x as i32, y as i32 - 1),
-        (x as i32 + 1, y as i32),
-        (x as i32, y as i32 + 1),
-        (x as i32 - 1, y as i32),
-    ];
-    for (nx, ny) in neighbors {
+    let selected = document.selected_glyph;
+    let stroke_fam = shape_families::stroke_family(selected);
+
+    // Start from the origin cell's existing canonical pattern so drawing
+    // through an existing box cell preserves unrelated connection slots,
+    // then override slots where a neighbor actively presents a family on
+    // that side. (We don't override with `None` — a box neighbor that
+    // doesn't face us shouldn't erase an existing slot.)
+    let current_glyph = document.layers[layer_index].get(w, x, y).glyph;
+    let mut pattern =
+        shape_families::glyph_to_pattern(current_glyph).unwrap_or(ConnectionPattern::EMPTY);
+    for side in Side::ALL {
+        if let Some(facing) = neighbor_facing_if_family(document, x, y, side) {
+            if !matches!(facing, LineStyle::None) {
+                pattern = pattern.with(side, facing);
+            }
+        }
+    }
+
+    // Stroke force: every cell in a stroke is implicitly connected to the
+    // previous cell the pencil visited. Without this, turning direction
+    // mid-stroke (e.g. starting horizontal then going down) wouldn't form
+    // a corner — the previous cell's glyph has no connection on the side
+    // facing us. Also fills in the "new cell under empty canvas adjacent to
+    // first stroke cell" case so a 2-cell stroke actually links up.
+    if let Some((fx, fy)) = from {
+        if let Some(side) = orthogonal_side_toward(x, y, fx, fy) {
+            if !matches!(stroke_fam, LineStyle::None) {
+                pattern = pattern.with(side, stroke_fam);
+            }
+        }
+    }
+
+    // Resolve glyph: direct lookup, then coerce mismatched opposites to the
+    // stroke's family, then fall back to the selected glyph so an isolated
+    // click still places the user's pick.
+    let glyph = shape_families::pattern_to_glyph(pattern)
+        .or_else(|| shape_families::pattern_to_glyph(shape_families::coerce_to_family(pattern, stroke_fam)))
+        .unwrap_or(selected);
+
+    let new_tile = Tile {
+        glyph,
+        fg: document.fg,
+        bg: document.bg,
+    };
+    write_cell(document, history, layer_index, w, x, y, new_tile);
+
+    // For neighbor refresh we advertise the written glyph's canonical
+    // pattern. This is what makes cross-family work: writing 179 above an
+    // existing 205 lets the 205 neighbor see `bottom=Single` coming at it
+    // and upgrade to 207 (╧). The canonical also carries any implied
+    // arms of a stub glyph so adjacent pre-existing lines merge in.
+    let our_canonical = shape_families::glyph_to_pattern(glyph).unwrap_or(pattern);
+
+    for side in Side::ALL {
+        let (nx, ny) = side.step(x, y);
         if nx < 0 || ny < 0 || nx >= document.width as i32 || ny >= document.height as i32 {
             continue;
         }
         let nx = nx as u32;
         let ny = ny as u32;
-        if !is_family_at(document, nx, ny, family) {
+        let n_glyph = document.layers[layer_index].get(w, nx, ny).glyph;
+        let Some(n_pattern) = shape_families::glyph_to_pattern(n_glyph) else {
+            continue;
+        };
+        // Neighbors placed by this stroke re-derive their pattern entirely
+        // from their actual neighbors (drops canonical stubs — so a corner
+        // comes out as ┐ instead of ┬). Pre-existing neighbors keep their
+        // canonical so drawing through them preserves unrelated arms.
+        let updated = if fresh_cells.contains(&(nx, ny)) {
+            rederive_pattern(document, nx, ny)
+        } else {
+            let our_facing: LineStyle = our_canonical.get(side);
+            n_pattern.with(side.opposite(), our_facing)
+        };
+        let n_family = shape_families::stroke_family(n_glyph);
+        let new_glyph = shape_families::pattern_to_glyph(updated)
+            .or_else(|| {
+                shape_families::pattern_to_glyph(shape_families::coerce_to_family(
+                    updated, n_family,
+                ))
+            })
+            .unwrap_or(n_glyph);
+        if new_glyph == n_glyph {
             continue;
         }
-        refresh_family_cell(document, history, layer_index, w, nx, ny, family, false);
+        let existing = document.layers[layer_index].get(w, nx, ny);
+        let new_tile = Tile {
+            glyph: new_glyph,
+            fg: existing.fg,
+            bg: existing.bg,
+        };
+        write_cell(document, history, layer_index, w, nx, ny, new_tile);
     }
 }
 
-/// Compute the connection mask for `(x, y)` and write the matching glyph.
-/// If `writing_origin` is true this is the cell under the pencil — preserve
-/// its fg/bg using the document's active colors (matching Simple pencil). If
-/// false this is a neighbor being re-evaluated — keep its existing fg/bg so
-/// we don't recolor the user's old strokes.
-fn refresh_family_cell(
-    document: &mut Document,
-    history: &mut History,
-    layer_index: usize,
-    w: u32,
-    x: u32,
-    y: u32,
-    family: &shape_families::ConnectedFamily,
-    writing_origin: bool,
-) {
-    // For the origin we count neighbors as-of-now (the cell itself isn't yet
-    // written; we're about to write it). For a neighbor refresh, we count
-    // from the neighbor's perspective, and the origin cell is already written
-    // — is_family_at will see it.
-    let mask = neighbor_connection_mask(document, x, y, family);
-    let glyph = family
-        .glyph_for_mask(mask)
-        .unwrap_or(document.selected_glyph);
-    let (fg, bg) = if writing_origin {
-        (document.fg, document.bg)
-    } else {
-        let existing = document.layers[layer_index].get(w, x, y);
-        (existing.fg, existing.bg)
-    };
-    let new_tile = Tile { glyph, fg, bg };
-    write_cell(document, history, layer_index, w, x, y, new_tile);
+/// Rebuild a cell's connection pattern from scratch using only what each of
+/// its four neighbors actually presents — no preserved canonical slots. Used
+/// on refresh targets that were placed by the current stroke.
+fn rederive_pattern(document: &Document, x: u32, y: u32) -> shape_families::ConnectionPattern {
+    use shape_families::{ConnectionPattern, LineStyle, Side};
+    let mut pattern = ConnectionPattern::EMPTY;
+    for side in Side::ALL {
+        if let Some(facing) = neighbor_facing_if_family(document, x, y, side) {
+            if !matches!(facing, LineStyle::None) {
+                pattern = pattern.with(side, facing);
+            }
+        }
+    }
+    pattern
 }
 
-/// 4-bit mask: which of `(x, y)`'s four neighbors are family members?
-fn neighbor_connection_mask(
+/// Which side of `(x, y)` faces `(fx, fy)`? `None` if the two cells are not
+/// orthogonally adjacent.
+fn orthogonal_side_toward(x: u32, y: u32, fx: u32, fy: u32) -> Option<shape_families::Side> {
+    let dx = fx as i32 - x as i32;
+    let dy = fy as i32 - y as i32;
+    match (dx, dy) {
+        (0, -1) => Some(shape_families::Side::Top),
+        (1, 0) => Some(shape_families::Side::Right),
+        (0, 1) => Some(shape_families::Side::Bottom),
+        (-1, 0) => Some(shape_families::Side::Left),
+        _ => None,
+    }
+}
+
+/// What family does `(x, y)`'s neighbor in `side` present back toward `(x, y)`?
+/// `None` if the neighbor is out-of-bounds or isn't a box-drawing glyph —
+/// which lets the caller distinguish "no family neighbor here" (keep the
+/// origin's existing slot) from "family neighbor presents None on this side".
+fn neighbor_facing_if_family(
     document: &Document,
     x: u32,
     y: u32,
-    family: &shape_families::ConnectedFamily,
-) -> u8 {
-    let mut mask = 0;
-    if y > 0 && is_family_at(document, x, y - 1, family) {
-        mask |= shape_families::CONN_TOP;
+    side: shape_families::Side,
+) -> Option<shape_families::LineStyle> {
+    let (nx, ny) = side.step(x, y);
+    if nx < 0 || ny < 0 || nx >= document.width as i32 || ny >= document.height as i32 {
+        return None;
     }
-    if x + 1 < document.width && is_family_at(document, x + 1, y, family) {
-        mask |= shape_families::CONN_RIGHT;
-    }
-    if y + 1 < document.height && is_family_at(document, x, y + 1, family) {
-        mask |= shape_families::CONN_BOTTOM;
-    }
-    if x > 0 && is_family_at(document, x - 1, y, family) {
-        mask |= shape_families::CONN_LEFT;
-    }
-    mask
-}
-
-fn is_family_at(
-    document: &Document,
-    x: u32,
-    y: u32,
-    family: &shape_families::ConnectedFamily,
-) -> bool {
     let w = document.width;
-    let tile = document.layers[document.active_layer].get(w, x, y);
-    family.contains(tile.glyph)
+    let n_glyph = document.layers[document.active_layer]
+        .get(w, nx as u32, ny as u32)
+        .glyph;
+    let n_pattern = shape_families::glyph_to_pattern(n_glyph)?;
+    Some(n_pattern.get(side.opposite()))
 }
 
 /// Fill the active layer's selected region with the current (glyph, fg, bg).
