@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use crate::document::{CellRect, Document};
-use crate::history::{CellChange, History};
+use crate::history::{CellChange, Command, History};
+use crate::layer::Layer;
 use crate::tile::{TRANSPARENT_BG, Tile};
 
 pub mod shape_families;
@@ -12,14 +13,16 @@ pub enum ToolKind {
     Select,
     Line,
     Rectangle,
+    Move,
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 4] = [
+    pub const ALL: [ToolKind; 5] = [
         ToolKind::Pencil,
         ToolKind::Select,
         ToolKind::Line,
         ToolKind::Rectangle,
+        ToolKind::Move,
     ];
 
     pub fn label(self) -> &'static str {
@@ -28,6 +31,7 @@ impl ToolKind {
             ToolKind::Select => "Select",
             ToolKind::Line => "Line",
             ToolKind::Rectangle => "Rectangle",
+            ToolKind::Move => "Move",
         }
     }
 
@@ -39,6 +43,7 @@ impl ToolKind {
             ToolKind::Select => "M",
             ToolKind::Line => "L",
             ToolKind::Rectangle => "R",
+            ToolKind::Move => "V",
         }
     }
 }
@@ -359,10 +364,19 @@ fn run_on_selection(
     }
     let new_tile = make_tile(document);
     let w = document.width;
+    let h = document.height;
     let layer_index = document.active_layer;
+    let (dx, dy) = document.layers[layer_index].offset;
     history.begin_stroke();
-    for (x, y) in cells {
-        write_cell(document, history, layer_index, w, x, y, new_tile);
+    for (cx, cy) in cells {
+        // Selection is in canvas space; the active layer may be offset, so
+        // translate each cell to the layer's buffer coordinate before writing.
+        let lx = cx as i32 - dx;
+        let ly = cy as i32 - dy;
+        if lx < 0 || ly < 0 || lx >= w as i32 || ly >= h as i32 {
+            continue;
+        }
+        write_cell(document, history, layer_index, w, lx as u32, ly as u32, new_tile);
     }
     history.end_stroke();
 }
@@ -466,8 +480,10 @@ pub fn rectangle_cell_glyphs(
         .collect()
 }
 
-/// Commit a rectangle stroke over `rect` using the active (glyph, fg, bg).
-/// Caller brackets with `begin_stroke` / `end_stroke` for one-shot undo.
+/// Commit a rectangle stroke over `rect` (canvas coords) using the active
+/// (glyph, fg, bg). Caller brackets with `begin_stroke` / `end_stroke` for
+/// one-shot undo. Cells whose buffer coord (canvas - active-layer-offset)
+/// falls outside the layer buffer are skipped.
 pub fn commit_rectangle(
     document: &mut Document,
     history: &mut History,
@@ -482,12 +498,18 @@ pub fn commit_rectangle(
         return;
     }
     let layer_index = document.active_layer;
+    let (dx, dy) = document.layers[layer_index].offset;
     let fg = document.fg;
     let bg = document.bg;
     let selected = document.selected_glyph;
-    for (x, y, glyph) in rectangle_cell_glyphs(rect, mode, selected) {
+    for (cx, cy, glyph) in rectangle_cell_glyphs(rect, mode, selected) {
+        let lx = cx as i32 - dx;
+        let ly = cy as i32 - dy;
+        if lx < 0 || ly < 0 || lx >= cw as i32 || ly >= ch as i32 {
+            continue;
+        }
         let new_tile = Tile { glyph, fg, bg };
-        write_cell(document, history, layer_index, cw, x, y, new_tile);
+        write_cell(document, history, layer_index, cw, lx as u32, ly as u32, new_tile);
     }
 }
 
@@ -517,6 +539,8 @@ fn slot_glyph(f: &shape_families::RectFamily, rect: CellRect, x: u32, y: u32) ->
 /// Commit a line stroke between two canvas cells using the active
 /// (glyph, fg, bg). Caller is responsible for bracketing with
 /// `begin_stroke` / `end_stroke` so the line lands as a single undo step.
+/// Cells whose buffer coord (canvas − active-layer-offset) falls outside
+/// the layer buffer are skipped.
 pub fn commit_line(
     document: &mut Document,
     history: &mut History,
@@ -526,16 +550,19 @@ pub fn commit_line(
     let w = document.width;
     let h = document.height;
     let layer_index = document.active_layer;
+    let (dx, dy) = document.layers[layer_index].offset;
     let new_tile = Tile {
         glyph: document.selected_glyph,
         fg: document.fg,
         bg: document.bg,
     };
     for (cx, cy) in bresenham_cells(start.0 as i32, start.1 as i32, end.0 as i32, end.1 as i32) {
-        if cx < 0 || cy < 0 || cx >= w as i32 || cy >= h as i32 {
+        let lx = cx - dx;
+        let ly = cy - dy;
+        if lx < 0 || ly < 0 || lx >= w as i32 || ly >= h as i32 {
             continue;
         }
-        write_cell(document, history, layer_index, w, cx as u32, cy as u32, new_tile);
+        write_cell(document, history, layer_index, w, lx as u32, ly as u32, new_tile);
     }
 }
 
@@ -563,4 +590,114 @@ fn write_cell(
         before,
         after: new_tile,
     });
+}
+
+/// A single non-empty cell captured by Ctrl+C. `dx`/`dy` are offsets from
+/// the clipboard's bounding-box top-left, so irregular selections (oval,
+/// Cell-mode) round-trip exactly.
+#[derive(Clone, Debug)]
+pub struct ClipCell {
+    pub dx: u32,
+    pub dy: u32,
+    pub tile: Tile,
+}
+
+/// Sparse tile clipboard built from a SelectionMask. `w`/`h` are the
+/// bounding-box dimensions; only originally-selected cells appear in `cells`.
+#[derive(Clone, Debug)]
+pub struct Clipboard {
+    pub w: u32,
+    pub h: u32,
+    pub cells: Vec<ClipCell>,
+}
+
+/// Capture the cells under `document.selection` on the active layer into a
+/// new `Clipboard`. Returns `None` if there is no active selection.
+pub fn copy_selection(document: &Document) -> Option<Clipboard> {
+    let mask = document.selection.as_ref()?;
+    let w = document.width;
+    let mut min_x = u32::MAX;
+    let mut min_y = u32::MAX;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    let mut any = false;
+    for (x, y) in mask.iter_cells() {
+        any = true;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    if !any {
+        return None;
+    }
+    let layer = document.layers.get(document.active_layer)?;
+    let mut cells = Vec::new();
+    for (x, y) in mask.iter_cells() {
+        cells.push(ClipCell {
+            dx: x - min_x,
+            dy: y - min_y,
+            tile: layer.get(w, x, y),
+        });
+    }
+    Some(Clipboard {
+        w: max_x - min_x + 1,
+        h: max_y - min_y + 1,
+        cells,
+    })
+}
+
+/// Commit a paste at `(origin_x, origin_y)` (canvas coords) as the
+/// clipboard's top-left. When `new_layer` is true the pasted cells go into
+/// a freshly created layer (appended on top, made active, undoable as a
+/// single AddLayer command). Otherwise the cells land on the active layer
+/// as a normal stroke, translated into that layer's buffer by its offset.
+/// Cells falling outside the layer buffer are silently clipped.
+pub fn commit_paste(
+    document: &mut Document,
+    history: &mut History,
+    clipboard: &Clipboard,
+    origin_x: u32,
+    origin_y: u32,
+    new_layer: bool,
+) {
+    if clipboard.cells.is_empty() {
+        return;
+    }
+    let cw = document.width;
+    let ch = document.height;
+    if new_layer {
+        // New layers are born with offset (0, 0), so canvas coords land
+        // directly in the buffer.
+        let name = format!("Layer {}", document.layers.len() + 1);
+        let mut layer = Layer::new(name, cw, ch);
+        for cc in &clipboard.cells {
+            let x = origin_x.saturating_add(cc.dx);
+            let y = origin_y.saturating_add(cc.dy);
+            if x >= cw || y >= ch {
+                continue;
+            }
+            layer.set(cw, x, y, cc.tile);
+        }
+        let index = document.layers.len();
+        document.layers.push(layer.clone());
+        document.active_layer = index;
+        document.bump_resources();
+        history.push(Command::AddLayer { index, layer });
+    } else {
+        let layer_index = document.active_layer;
+        let (dx, dy) = document.layers[layer_index].offset;
+        history.begin_stroke();
+        for cc in &clipboard.cells {
+            let cx = origin_x as i32 + cc.dx as i32;
+            let cy = origin_y as i32 + cc.dy as i32;
+            let lx = cx - dx;
+            let ly = cy - dy;
+            if lx < 0 || ly < 0 || lx >= cw as i32 || ly >= ch as i32 {
+                continue;
+            }
+            write_cell(document, history, layer_index, cw, lx as u32, ly as u32, cc.tile);
+        }
+        history.end_stroke();
+    }
 }

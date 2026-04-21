@@ -1,6 +1,8 @@
 use crate::document::Document;
 use crate::history::History;
 use crate::renderer::CanvasRenderResources;
+use crate::tools;
+use crate::ui::canvas_view::PastePreview;
 use crate::ui::{self, GlyphNavTarget, UiState};
 
 pub struct TxPaintApp {
@@ -75,7 +77,41 @@ fn handle_global_shortcuts(
         if ctrl && i.key_pressed(egui::Key::Z) && i.modifiers.shift {
             history.redo(document);
         }
+        // egui converts Ctrl+C / Ctrl+V into Copy / Paste events (so they
+        // round-trip through the OS clipboard for text), rather than firing
+        // `key_pressed(Key::C/V)`. Hook the events to run our selection
+        // copy / paste-mode entry. Skipped when a text field owns focus so
+        // real text paste still works.
+        if !text_has_focus {
+            for event in &i.events {
+                match event {
+                    egui::Event::Copy => {
+                        if let Some(clip) = tools::copy_selection(document) {
+                            ui_state.canvas_view.clipboard = Some(clip);
+                        }
+                    }
+                    egui::Event::Paste(_) => {
+                        if ui_state.canvas_view.clipboard.is_some() {
+                            ui_state.canvas_view.select_drag = None;
+                            ui_state.canvas_view.line_drag = None;
+                            ui_state.canvas_view.rect_drag = None;
+                            ui_state.canvas_view.paste_preview =
+                                Some(PastePreview { origin: None });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         if !ctrl && !i.modifiers.alt && !text_has_focus {
+            let tool_key = i.key_pressed(egui::Key::B)
+                || i.key_pressed(egui::Key::M)
+                || i.key_pressed(egui::Key::L)
+                || i.key_pressed(egui::Key::R)
+                || i.key_pressed(egui::Key::V);
+            if tool_key {
+                ui_state.canvas_view.paste_preview = None;
+            }
             if i.key_pressed(egui::Key::B) {
                 document.active_tool = ToolKind::Pencil;
             }
@@ -87,6 +123,9 @@ fn handle_global_shortcuts(
             }
             if i.key_pressed(egui::Key::R) {
                 document.active_tool = ToolKind::Rectangle;
+            }
+            if i.key_pressed(egui::Key::V) {
+                document.active_tool = ToolKind::Move;
             }
             if i.key_pressed(egui::Key::X) {
                 std::mem::swap(&mut document.fg, &mut document.bg);

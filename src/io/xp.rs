@@ -49,14 +49,26 @@ pub fn write<W: Write>(w: &mut W, document: &Document) -> Result<()> {
     w.write_i32::<LittleEndian>(XP_VERSION)?;
     w.write_i32::<LittleEndian>(document.layers.len() as i32)?;
 
+    let cw = document.width;
+    let ch = document.height;
+    let blank = Tile::default();
     for layer in &document.layers {
-        w.write_i32::<LittleEndian>(document.width as i32)?;
-        w.write_i32::<LittleEndian>(document.height as i32)?;
-        // Column-major: iterate x then y.
-        for x in 0..document.width {
-            for y in 0..document.height {
-                let idx = (y * document.width + x) as usize;
-                let t = layer.tiles[idx];
+        w.write_i32::<LittleEndian>(cw as i32)?;
+        w.write_i32::<LittleEndian>(ch as i32)?;
+        // Save is WYSIWYG: bake each layer's display offset into its saved
+        // cell positions. Content whose buffer coord maps outside the canvas
+        // after the shift is simply not included (the .xp format has no
+        // per-layer offset concept). The in-memory layer is unchanged.
+        let (dx, dy) = layer.offset;
+        for x in 0..cw {
+            for y in 0..ch {
+                let lx = x as i32 - dx;
+                let ly = y as i32 - dy;
+                let t = if lx >= 0 && ly >= 0 && lx < cw as i32 && ly < ch as i32 {
+                    layer.tiles[(ly as u32 * cw + lx as u32) as usize]
+                } else {
+                    blank
+                };
                 w.write_i32::<LittleEndian>(t.glyph as i32)?;
                 w.write_u8(t.fg.0[0])?;
                 w.write_u8(t.fg.0[1])?;

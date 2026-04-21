@@ -296,18 +296,39 @@ impl CanvasRenderResources {
         }
     }
 
-    fn upload_layer_full(&self, queue: &wgpu::Queue, layer_index: usize, tiles: &[Tile]) {
+    fn upload_layer_full(
+        &self,
+        queue: &wgpu::Queue,
+        layer_index: usize,
+        tiles: &[Tile],
+        offset: (i32, i32),
+    ) {
         let l = &self.layers[layer_index];
         let w = self.canvas_w;
         let h = self.canvas_h;
 
+        // Build a canvas-space view by sampling `tiles` (layer-buffer coords)
+        // at each canvas cell's shifted position. Cells whose source falls
+        // outside the layer buffer render as transparent so they don't leak
+        // stale content from a previous offset.
+        let (dx, dy) = offset;
         let mut glyphs = Vec::with_capacity((w * h) as usize);
         let mut fgs = Vec::with_capacity((w * h * 4) as usize);
         let mut bgs = Vec::with_capacity((w * h * 4) as usize);
-        for t in tiles {
-            glyphs.push(t.glyph);
-            fgs.extend_from_slice(&t.fg.0);
-            bgs.extend_from_slice(&t.bg.0);
+        let blank = Tile::default();
+        for cy in 0..h {
+            for cx in 0..w {
+                let lx = cx as i32 - dx;
+                let ly = cy as i32 - dy;
+                let t = if lx >= 0 && ly >= 0 && lx < w as i32 && ly < h as i32 {
+                    tiles[(ly as u32 * w + lx as u32) as usize]
+                } else {
+                    blank
+                };
+                glyphs.push(t.glyph);
+                fgs.extend_from_slice(&t.fg.0);
+                bgs.extend_from_slice(&t.bg.0);
+            }
         }
 
         let extent = wgpu::Extent3d {
@@ -362,14 +383,33 @@ impl CanvasRenderResources {
         );
     }
 
-    fn upload_cells(&self, queue: &wgpu::Queue, layer_index: usize, cells: &[(u32, u32, Tile)]) {
+    fn upload_cells(
+        &self,
+        queue: &wgpu::Queue,
+        layer_index: usize,
+        cells: &[(u32, u32, Tile)],
+        offset: (i32, i32),
+    ) {
         let l = &self.layers[layer_index];
         let one = wgpu::Extent3d {
             width: 1,
             height: 1,
             depth_or_array_layers: 1,
         };
-        for &(x, y, t) in cells {
+        let (dx, dy) = offset;
+        let cw = self.canvas_w as i32;
+        let ch = self.canvas_h as i32;
+        for &(lx, ly, t) in cells {
+            // Translate layer-buffer coord → canvas coord and clip. Off-canvas
+            // edits simply leave the GPU texture alone; the layer buffer itself
+            // (in Document) still carries the change for when the layer is
+            // scrolled back into view.
+            let cx = lx as i32 + dx;
+            let cy = ly as i32 + dy;
+            if cx < 0 || cy < 0 || cx >= cw || cy >= ch {
+                continue;
+            }
+            let (x, y) = (cx as u32, cy as u32);
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &l.glyph_tex,
@@ -514,6 +554,11 @@ pub struct CanvasRenderRequest {
 
 pub struct LayerRenderRequest {
     pub visible: bool,
+    /// Display shift: the layer's buffer cell (lx, ly) is rendered at canvas
+    /// cell (lx + offset.0, ly + offset.1). `full_tiles` carries layer-buffer
+    /// content as-is; the upload path builds the shifted canvas-space view
+    /// from it. `dirty_cells` positions are in layer-buffer coords too.
+    pub offset: (i32, i32),
     pub full_tiles: Option<Arc<Vec<Tile>>>,
     pub dirty_cells: Vec<(u32, u32, Tile)>,
 }
@@ -548,6 +593,7 @@ impl CanvasRenderRequest {
             }
             layers.push(LayerRenderRequest {
                 visible: layer.visible,
+                offset: layer.offset,
                 full_tiles,
                 dirty_cells,
             });
@@ -596,10 +642,10 @@ impl egui_wgpu::CallbackTrait for CanvasCallback {
 
         for (i, layer_req) in self.request.layers.iter().enumerate() {
             if let Some(tiles) = &layer_req.full_tiles {
-                res.upload_layer_full(queue, i, tiles.as_slice());
+                res.upload_layer_full(queue, i, tiles.as_slice(), layer_req.offset);
             }
             if !layer_req.dirty_cells.is_empty() {
-                res.upload_cells(queue, i, &layer_req.dirty_cells);
+                res.upload_cells(queue, i, &layer_req.dirty_cells, layer_req.offset);
             }
         }
         Vec::new()

@@ -6,7 +6,7 @@ use crate::document::{CellRect, Document, SelectionMask};
 use crate::font::FontAtlas;
 use crate::history::History;
 use crate::renderer::{CanvasCallback, CanvasRenderRequest};
-use crate::tools::{self, RectMode, SelectMode, ToolKind};
+use crate::tools::{self, Clipboard, RectMode, SelectMode, ToolKind};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SelectOp {
@@ -33,6 +33,8 @@ pub struct CanvasViewState {
     pub line_drag: Option<LineDrag>,
     /// Corners of an in-progress Rectangle-tool drag. Committed on mouse-up.
     pub rect_drag: Option<RectDrag>,
+    /// State for an in-progress Move-tool drag on the active layer.
+    pub move_drag: Option<MoveDrag>,
     /// Last cell visited by the Pencil during the current stroke. Used to
     /// Bresenham-interpolate between pointer frames so fast drags don't skip
     /// cells (important for Dynamic mode's connectivity).
@@ -48,6 +50,22 @@ pub struct CanvasViewState {
     /// document's `resources_generation` changes (font swap, etc.).
     atlas_texture: Option<TextureHandle>,
     atlas_generation: u64,
+    /// Tile clipboard populated by Ctrl+C on a selection. Survives across
+    /// pastes so repeated Ctrl+V uses the same data. Survives document
+    /// swaps (canvas coordinates are absolute).
+    pub clipboard: Option<Clipboard>,
+    /// When `Some`, the user is in paste mode: a ghost overlay follows the
+    /// mouse, normal tool dispatch is suspended, and a primary click commits
+    /// the paste (Shift = into a new layer).
+    pub paste_preview: Option<PastePreview>,
+}
+
+/// Ephemeral state for an in-progress paste placement. `origin` is the
+/// canvas-space cell where the clipboard's top-left should land; it tracks
+/// hover_cell each frame. `None` when the cursor isn't over the canvas yet.
+#[derive(Copy, Clone, Debug)]
+pub struct PastePreview {
+    pub origin: Option<(u32, u32)>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -71,6 +89,19 @@ pub struct RectDrag {
     pub mode: RectMode,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct MoveDrag {
+    /// Layer being moved (captured at drag start so a mid-drag active-layer
+    /// change doesn't redirect the move to a different layer).
+    pub layer_index: usize,
+    /// Layer offset at the start of the drag — used to compute the new
+    /// offset from the drag delta and as the `from` of the undo command.
+    pub from: (i32, i32),
+    /// Cursor position at drag start (in egui points); per-frame offset is
+    /// derived from the current cursor position minus this.
+    pub initial_pos: egui::Pos2,
+}
+
 impl Default for CanvasViewState {
     fn default() -> Self {
         Self {
@@ -80,10 +111,13 @@ impl Default for CanvasViewState {
             select_drag: None,
             line_drag: None,
             rect_drag: None,
+            move_drag: None,
             pencil_last: None,
             pencil_stroke_fresh: HashSet::new(),
             atlas_texture: None,
             atlas_generation: 0,
+            clipboard: None,
+            paste_preview: None,
         }
     }
 }
@@ -182,8 +216,28 @@ pub fn show(
         Some((cx as u32, cy as u32))
     });
 
-    // Tool dispatch: primary click/drag only (middle drags pan).
+    // Paste mode short-circuits normal tool dispatch. The ghost overlay
+    // tracks the mouse; a primary click commits (Shift = into a new layer).
     let primary_down = ui.input(|i| i.pointer.primary_down());
+    if view.paste_preview.is_some() {
+        if let Some(preview) = view.paste_preview.as_mut() {
+            if let Some(cell) = hover_cell {
+                preview.origin = Some(cell);
+            }
+        }
+        // Accept either a clean click or a drag-release so the paste commits
+        // even if the user wiggled the cursor past egui's drag threshold.
+        if response.clicked_by(PointerButton::Primary)
+            || response.drag_stopped_by(PointerButton::Primary)
+        {
+            let shift = ui.input(|i| i.modifiers.shift);
+            let origin = view.paste_preview.and_then(|p| p.origin);
+            if let (Some(clip), Some((ox, oy))) = (view.clipboard.as_ref(), origin) {
+                tools::commit_paste(document, history, clip, ox, oy, shift);
+            }
+            view.paste_preview = None;
+        }
+    } else {
     match document.active_tool {
         ToolKind::Select => {
             let modifiers = ui.input(|i| i.modifiers);
@@ -374,6 +428,23 @@ pub fn show(
             }
         }
         ToolKind::Pencil => {
+            // Pencil operates in layer-buffer coord space. Translate the
+            // canvas hover cell by the active layer's offset; if it maps
+            // outside the buffer, treat it like no-hover.
+            let layer_cell = hover_cell.and_then(|(cx, cy)| {
+                let (dx, dy) = document.layers[document.active_layer].offset;
+                let lx = cx as i32 - dx;
+                let ly = cy as i32 - dy;
+                if lx < 0
+                    || ly < 0
+                    || lx >= document.width as i32
+                    || ly >= document.height as i32
+                {
+                    None
+                } else {
+                    Some((lx as u32, ly as u32))
+                }
+            });
             if response.drag_started_by(PointerButton::Primary)
                 || response.clicked_by(PointerButton::Primary)
             {
@@ -384,7 +455,7 @@ pub fn show(
             if (response.dragged_by(PointerButton::Primary) && primary_down)
                 || response.clicked_by(PointerButton::Primary)
             {
-                if let Some((x, y)) = hover_cell {
+                if let Some((x, y)) = layer_cell {
                     // Interpolate between frames so a fast drag doesn't skip
                     // cells. Relevant for Dynamic mode (connections rely on
                     // cell adjacency) and nice-to-have for Simple.
@@ -428,6 +499,59 @@ pub fn show(
                 view.pencil_stroke_fresh.clear();
             }
         }
+        ToolKind::Move => {
+            // Drag the active layer around. `offset` is stored on Layer and
+            // applied at render time; cells that scroll off-canvas stay in
+            // the layer buffer and reappear when scrolled back.
+            if response.drag_started_by(PointerButton::Primary) {
+                if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                    let layer_index = document.active_layer;
+                    let from = document
+                        .layers
+                        .get(layer_index)
+                        .map(|l| l.offset)
+                        .unwrap_or((0, 0));
+                    view.move_drag = Some(MoveDrag {
+                        layer_index,
+                        from,
+                        initial_pos: p,
+                    });
+                }
+            }
+            if response.dragged_by(PointerButton::Primary) {
+                if let (Some(drag), Some(p)) =
+                    (view.move_drag, ui.input(|i| i.pointer.interact_pos()))
+                {
+                    let delta_px = p - drag.initial_pos;
+                    // Snap to whole cells so the offset is always a clean
+                    // integer and the renderer doesn't need sub-cell logic.
+                    let delta_x = (delta_px.x / cell_pixel_w).round() as i32;
+                    let delta_y = (delta_px.y / cell_pixel_h).round() as i32;
+                    let new_offset = (drag.from.0 + delta_x, drag.from.1 + delta_y);
+                    if let Some(layer) = document.layers.get_mut(drag.layer_index) {
+                        if layer.offset != new_offset {
+                            layer.offset = new_offset;
+                            layer.full_upload = true;
+                        }
+                    }
+                }
+            }
+            if response.drag_stopped_by(PointerButton::Primary) {
+                if let Some(drag) = view.move_drag.take() {
+                    if let Some(layer) = document.layers.get(drag.layer_index) {
+                        let to = layer.offset;
+                        if to != drag.from {
+                            history.push(crate::history::Command::MoveLayer {
+                                index: drag.layer_index,
+                                from: drag.from,
+                                to,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
     }
 
     // Visual backdrop.
@@ -582,15 +706,85 @@ pub fn show(
         painter.rect_stroke(shape_rect, 0.0, outline, egui::StrokeKind::Inside);
     }
 
-    if let Some((x, y)) = hover_cell {
-        let min = unclipped.min + Vec2::new(x as f32 * cell_pixel_w, y as f32 * cell_pixel_h);
-        let cell_rect = egui::Rect::from_min_size(min, Vec2::new(cell_pixel_w, cell_pixel_h));
-        ui.painter().rect_stroke(
-            cell_rect.intersect(draw_rect),
-            0.0,
-            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 0, 180)),
-            egui::StrokeKind::Inside,
-        );
+    // Paste ghost preview: stamp each clipboard cell at origin+(dx,dy) with
+    // a semi-transparent bg backdrop and tinted glyph, plus a yellow bbox
+    // outline. Same egui-painter path as the rectangle-tool preview.
+    if let (Some(preview), Some(clip)) = (view.paste_preview, view.clipboard.as_ref()) {
+        if let Some((ox, oy)) = preview.origin {
+            let texture = ensure_atlas_texture(
+                ui.ctx(),
+                &mut view.atlas_texture,
+                &mut view.atlas_generation,
+                &document.font,
+                document.resources_generation,
+            );
+            let tex_id = texture.id();
+            let painter = ui.painter_at(draw_rect);
+            for cc in &clip.cells {
+                let cx = ox.saturating_add(cc.dx);
+                let cy = oy.saturating_add(cc.dy);
+                if cx >= document.width || cy >= document.height {
+                    continue;
+                }
+                let min = unclipped.min
+                    + Vec2::new(cx as f32 * cell_pixel_w, cy as f32 * cell_pixel_h);
+                let cell_rect =
+                    egui::Rect::from_min_size(min, Vec2::new(cell_pixel_w, cell_pixel_h));
+                let bg = cc.tile.bg;
+                let backdrop = if bg == crate::tile::TRANSPARENT_BG {
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 100)
+                } else {
+                    Color32::from_rgba_unmultiplied(bg.0[0], bg.0[1], bg.0[2], 160)
+                };
+                painter.rect_filled(cell_rect, 0.0, backdrop);
+                let fg = cc.tile.fg;
+                let glyph_tint =
+                    Color32::from_rgba_unmultiplied(fg.0[0], fg.0[1], fg.0[2], 200);
+                let glyph = cc.tile.glyph;
+                let gx = (glyph % 16) as f32;
+                let gy = (glyph / 16) as f32;
+                let uv = egui::Rect::from_min_max(
+                    [gx / 16.0, gy / 16.0].into(),
+                    [(gx + 1.0) / 16.0, (gy + 1.0) / 16.0].into(),
+                );
+                painter.add(egui::Shape::image(tex_id, cell_rect, uv, glyph_tint));
+            }
+            // Yellow bbox outline around the full paste extent (clipped to canvas).
+            let bbox_x = ox;
+            let bbox_y = oy;
+            let bbox_w = clip.w.min(document.width.saturating_sub(bbox_x));
+            let bbox_h = clip.h.min(document.height.saturating_sub(bbox_y));
+            if bbox_w > 0 && bbox_h > 0 {
+                let shape_min = unclipped.min
+                    + Vec2::new(
+                        bbox_x as f32 * cell_pixel_w,
+                        bbox_y as f32 * cell_pixel_h,
+                    );
+                let shape_size = Vec2::new(
+                    bbox_w as f32 * cell_pixel_w,
+                    bbox_h as f32 * cell_pixel_h,
+                );
+                let shape_rect = egui::Rect::from_min_size(shape_min, shape_size);
+                let outline =
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 0, 160));
+                painter.rect_stroke(shape_rect, 0.0, outline, egui::StrokeKind::Inside);
+            }
+        }
+    }
+
+    // Hover outline — suppressed during paste mode since the ghost overlay
+    // already marks the cursor position.
+    if view.paste_preview.is_none() {
+        if let Some((x, y)) = hover_cell {
+            let min = unclipped.min + Vec2::new(x as f32 * cell_pixel_w, y as f32 * cell_pixel_h);
+            let cell_rect = egui::Rect::from_min_size(min, Vec2::new(cell_pixel_w, cell_pixel_h));
+            ui.painter().rect_stroke(
+                cell_rect.intersect(draw_rect),
+                0.0,
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 0, 180)),
+                egui::StrokeKind::Inside,
+            );
+        }
     }
 
     // Reset-view hotkey: Home.
@@ -611,7 +805,13 @@ pub fn show(
             )
         });
         if escape {
-            document.selection = None;
+            // Escape cancels an in-progress paste first; only clears the
+            // selection if no paste is pending.
+            if view.paste_preview.is_some() {
+                view.paste_preview = None;
+            } else {
+                document.selection = None;
+            }
         }
         if ctrl_a {
             let mut mask = SelectionMask::new(document.width, document.height);

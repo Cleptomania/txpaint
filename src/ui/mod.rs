@@ -61,7 +61,7 @@ pub fn layout(
     egui::Panel::right("layers").default_size(260.0).show_inside(ui, |ui| {
         palette_panel::show(ui, document);
         ui.separator();
-        layers_panel::show(ui, document, &mut state.layers);
+        layers_panel::show(ui, document, history, &mut state.layers);
     });
 
     egui::Panel::bottom("glyph_picker").show_inside(ui, |ui| {

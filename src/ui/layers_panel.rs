@@ -1,6 +1,7 @@
 use egui::{Color32, RichText, Stroke};
 
 use crate::document::Document;
+use crate::history::{Command, History};
 use crate::layer::Layer;
 
 #[derive(Default)]
@@ -16,7 +17,12 @@ pub struct RenameState {
     pub just_started: bool,
 }
 
-pub fn show(ui: &mut egui::Ui, document: &mut Document, state: &mut LayersPanelState) {
+pub fn show(
+    ui: &mut egui::Ui,
+    document: &mut Document,
+    history: &mut History,
+    state: &mut LayersPanelState,
+) {
     ui.vertical(|ui| {
         ui.heading("Layers");
 
@@ -98,6 +104,21 @@ pub fn show(ui: &mut egui::Ui, document: &mut Document, state: &mut LayersPanelS
                         action = LayerAction::MoveDown(i);
                     }
                     if ui
+                        .small_button("⎘")
+                        .on_hover_text("Duplicate layer")
+                        .clicked()
+                    {
+                        action = LayerAction::Duplicate(i);
+                    }
+                    if i > 0
+                        && ui
+                            .small_button("⇓")
+                            .on_hover_text("Merge into layer below")
+                            .clicked()
+                    {
+                        action = LayerAction::MergeDown(i);
+                    }
+                    if ui
                         .small_button(RichText::new("✖").color(Color32::LIGHT_RED))
                         .clicked()
                     {
@@ -154,6 +175,36 @@ pub fn show(ui: &mut egui::Ui, document: &mut Document, state: &mut LayersPanelS
                 document.active_layer = document.layers.len() - 1;
                 document.bump_resources();
             }
+            LayerAction::MergeDown(i) => {
+                if i > 0 && i < document.layers.len() {
+                    let w = document.width;
+                    let h = document.height;
+                    let (low, high) = document.layers.split_at_mut(i);
+                    let top = &high[0];
+                    let bottom = &mut low[i - 1];
+                    bottom.merge_from_above(top, w, h);
+                    document.layers.remove(i);
+                    if document.active_layer == i {
+                        document.active_layer = i - 1;
+                    } else if document.active_layer > i {
+                        document.active_layer -= 1;
+                    }
+                    document.bump_resources();
+                }
+            }
+            LayerAction::Duplicate(i) => {
+                if let Some(src) = document.layers.get(i) {
+                    let mut copy = src.clone();
+                    copy.name = format!("{} copy", src.name);
+                    copy.dirty_cells.clear();
+                    copy.full_upload = true;
+                    let index = i + 1;
+                    document.layers.insert(index, copy.clone());
+                    document.active_layer = index;
+                    document.bump_resources();
+                    history.push(Command::AddLayer { index, layer: copy });
+                }
+            }
         }
     });
 }
@@ -164,5 +215,7 @@ enum LayerAction {
     MoveUp(usize),
     MoveDown(usize),
     Delete(usize),
+    Duplicate(usize),
+    MergeDown(usize),
     Add,
 }

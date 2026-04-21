@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::document::Document;
+use crate::layer::Layer;
 use crate::tile::Tile;
 
 pub const MAX_HISTORY: usize = 200;
@@ -17,6 +18,16 @@ pub struct CellChange {
 #[derive(Debug, Clone)]
 pub enum Command {
     Cells(Vec<CellChange>),
+    /// A new layer was inserted at `index`. Redo re-inserts the snapshot;
+    /// undo removes the layer at that index. Used by paste-to-new-layer.
+    AddLayer { index: usize, layer: Layer },
+    /// The layer at `index` had its display offset moved from `from` to
+    /// `to`. Redo sets offset to `to`; undo sets it back to `from`.
+    MoveLayer {
+        index: usize,
+        from: (i32, i32),
+        to: (i32, i32),
+    },
 }
 
 pub struct History {
@@ -111,6 +122,20 @@ fn apply_forward(cmd: &Command, document: &mut Document) {
                 }
             }
         }
+        Command::AddLayer { index, layer } => {
+            let i = (*index).min(document.layers.len());
+            document.layers.insert(i, layer.clone());
+            document.active_layer = i;
+            document.bump_resources();
+        }
+        Command::MoveLayer { index, to, .. } => {
+            if let Some(layer) = document.layers.get_mut(*index) {
+                if layer.offset != *to {
+                    layer.offset = *to;
+                    layer.full_upload = true;
+                }
+            }
+        }
     }
 }
 
@@ -121,6 +146,26 @@ fn apply_inverse(cmd: &Command, document: &mut Document) {
             for c in changes {
                 if let Some(layer) = document.layers.get_mut(c.layer) {
                     layer.set(w, c.x, c.y, c.before);
+                }
+            }
+        }
+        Command::AddLayer { index, .. } => {
+            // Document invariant: always keep at least one layer. If the
+            // paste produced the sole layer, leave it — matches the
+            // delete-button guard in `layers_panel.rs`.
+            if document.layers.len() > 1 && *index < document.layers.len() {
+                document.layers.remove(*index);
+                if document.active_layer >= document.layers.len() {
+                    document.active_layer = document.layers.len() - 1;
+                }
+                document.bump_resources();
+            }
+        }
+        Command::MoveLayer { index, from, .. } => {
+            if let Some(layer) = document.layers.get_mut(*index) {
+                if layer.offset != *from {
+                    layer.offset = *from;
+                    layer.full_upload = true;
                 }
             }
         }
